@@ -21,7 +21,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller
           pip install opencv-python
-          pip install mediapipe
+          pip install mediapipe==0.10.21
           pip install pillow
 
       - name: Crear programa Windows
