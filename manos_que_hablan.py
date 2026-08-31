@@ -18,7 +18,7 @@ from pathlib import Path
 
 # Versión instalada de la aplicación.
 # Al publicar una nueva Release, actualiza este valor (por ejemplo 1.0.2).
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.4"
 
 # GitHub Releases se usa como servidor de actualizaciones.
 GITHUB_OWNER = "manosqhablan26-coder"
@@ -105,30 +105,69 @@ landmark_history = {}
 # ==========================================================
 
 def buscar_camaras():
+    """Busca cámaras en Linux y Windows sin cambiar la lógica de MediaPipe."""
     camaras = []
 
     for i in range(10):
-        dispositivo = f"/dev/video{i}"
+        if os.name == "nt":
+            # En Windows probamos DirectShow primero y MSMF como respaldo.
+            # Guardamos el backend que realmente funcionó para reutilizarlo
+            # cuando el usuario pulse Iniciar.
+            cap_test = None
+            backend_usado = None
 
-        if not os.path.exists(dispositivo):
-            continue
+            for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF):
+                prueba = cv2.VideoCapture(i, backend)
 
-        cap_test = cv2.VideoCapture(i)
+                if prueba.isOpened():
+                    ret, frame = prueba.read()
 
-        if cap_test.isOpened():
-            ret, frame = cap_test.read()
+                    if ret and frame is not None:
+                        cap_test = prueba
+                        backend_usado = backend
+                        break
 
-            if ret and frame is not None:
-                alto, ancho = frame.shape[:2]
+                prueba.release()
 
-                camaras.append({
-                    "id": i,
-                    "dispositivo": dispositivo,
-                    "ancho": ancho,
-                    "alto": alto
-                })
+            if cap_test is None:
+                continue
 
-        cap_test.release()
+            dispositivo = f"Cámara {i}"
+            alto, ancho = frame.shape[:2]
+
+            camaras.append({
+                "id": i,
+                "dispositivo": dispositivo,
+                "ancho": ancho,
+                "alto": alto,
+                "backend": backend_usado
+            })
+
+            cap_test.release()
+
+        else:
+            dispositivo = f"/dev/video{i}"
+
+            if not os.path.exists(dispositivo):
+                continue
+
+            cap_test = cv2.VideoCapture(i)
+
+            if cap_test.isOpened():
+                ret, frame = cap_test.read()
+
+                if ret and frame is not None:
+                    alto, ancho = frame.shape[:2]
+
+                    camaras.append({
+                        "id": i,
+                        "dispositivo": dispositivo,
+                        "ancho": ancho,
+                        "alto": alto,
+                        "backend": None
+                    })
+
+            cap_test.release()
 
     return camaras
 
@@ -438,15 +477,20 @@ def iniciar_camara():
         return
 
     selected_camera_id = camera_items[seleccion]["id"]
+    nombre_camara = camera_items[seleccion]["dispositivo"]
+    backend_camara = camera_items[seleccion].get("backend")
 
-    set_status(f"Abriendo /dev/video{selected_camera_id}...")
+    set_status(f"Abriendo {nombre_camara}...")
 
-    cap = cv2.VideoCapture(selected_camera_id)
+    if os.name == "nt" and backend_camara is not None:
+        cap = cv2.VideoCapture(selected_camera_id, backend_camara)
+    else:
+        cap = cv2.VideoCapture(selected_camera_id)
 
     if not cap.isOpened():
         cap = None
         set_status(
-            f"No se pudo abrir /dev/video{selected_camera_id}.",
+            f"No se pudo abrir {nombre_camara}.",
             error=True
         )
         return
@@ -502,7 +546,7 @@ def iniciar_camara():
         fg=theme["muted"]
     )
 
-    set_status(f"Cámara activa: /dev/video{selected_camera_id}")
+    set_status(f"Cámara activa: {nombre_camara}")
 
 
 # ==========================================================
