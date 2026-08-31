@@ -3,12 +3,14 @@ import mediapipe as mp
 import threading
 import os
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import time
 import json
 import urllib.request
 import urllib.error
 import queue
+import hashlib
+import webbrowser
 from pathlib import Path
 
 
@@ -18,14 +20,41 @@ from pathlib import Path
 
 # Versión instalada de la aplicación.
 # Al publicar una nueva Release, actualiza este valor (por ejemplo 1.0.2).
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 # GitHub Releases se usa como servidor de actualizaciones.
 GITHUB_OWNER = "manosqhablan26-coder"
 GITHUB_REPO = "manos-que-hablan-"
+GITHUB_PROJECT_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+GITHUB_MODELS_PAGE_URL = f"{GITHUB_PROJECT_URL}/tree/main/modelos"
 GITHUB_LATEST_RELEASE_API = (
     f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 )
+
+# ==========================================================
+# MODELO DE SEÑAS EN GITHUB · SIN DELAY EN LA CÁMARA
+# ==========================================================
+# GitHub se usa SOLO para comprobar/descargar el archivo del modelo.
+# MediaPipe y reconocer_sena() siguen funcionando 100 % localmente.
+MODEL_GITHUB_BRANCH = "main"
+MODEL_GITHUB_FOLDER = "modelos"
+MODEL_MANIFEST_URL = (
+    f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/"
+    f"{MODEL_GITHUB_BRANCH}/{MODEL_GITHUB_FOLDER}/manifest.json"
+)
+
+# El último modelo descargado queda guardado aquí para poder abrir la app
+# incluso si en ese momento no hay Internet.
+MODEL_CACHE_DIR = Path.home() / ".manos_que_hablan" / "modelos"
+MODEL_CACHE_FILE = MODEL_CACHE_DIR / "modelo_senas.json"
+MODEL_CACHE_MANIFEST = MODEL_CACHE_DIR / "manifest.json"
+
+# Cada seña entrenada localmente se guarda en su propio JSON.
+# Ejemplo: modelos_entrenados/HOLA.json, A.json, GRACIAS.json, etc.
+LOCAL_TRAINED_MODELS_DIR = Path(__file__).resolve().parent / "modelos_entrenados"
+
+model_online_version = None
+model_sync_in_progress = False
 
 # Información de la última versión encontrada.
 latest_release_info = None
@@ -98,6 +127,418 @@ last_display_time = 0.0
 # ==========================================================
 stabilization_mode = "Baja"
 landmark_history = {}
+
+# ==========================================================
+# MODELO DE RECONOCIMIENTO
+# ==========================================================
+# El archivo JSON cargado se convierte a vectores normalizados una sola vez.
+# Así la comparación durante la cámara es ligera y no modifica la captura.
+loaded_recognition_model_path = None
+loaded_recognition_model_data = None
+
+# El reconocedor final combina dos fuentes en memoria:
+# 1) modelos externos (GitHub o cargados manualmente)
+# 2) todos los JSON de modelos_entrenados/
+recognition_external_samples = []
+recognition_local_samples = []
+recognition_local_files = []
+recognition_model_samples = []
+latest_recognized_sign = None
+latest_recognition_confidence = 0.0
+
+# Últimos landmarks ya procesados por el hilo principal de MediaPipe.
+# La ventana de entrenamiento reutiliza estos datos para capturar muestras
+# a la misma velocidad del procesamiento, sin crear otro detector por muestra.
+latest_recognition_hands_data = []
+
+
+def _vector_reconocimiento(hands_data):
+    """Convierte 1 o 2 manos a un vector comparable, independiente de posición/tamaño."""
+    if not hands_data:
+        return None
+
+    prepared = []
+
+    for hand in hands_data[:2]:
+        landmarks = hand.get("landmarks") if isinstance(hand, dict) else None
+        if not isinstance(landmarks, list) or len(landmarks) != 21:
+            return None
+
+        points = []
+        try:
+            for lm in landmarks:
+                if isinstance(lm, dict):
+                    points.append((float(lm["x"]), float(lm["y"]), float(lm["z"])))
+                else:
+                    points.append((float(lm.x), float(lm.y), float(lm.z)))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+
+        wx, wy, wz = points[0]
+        centered = [(x - wx, y - wy, z - wz) for x, y, z in points]
+
+        # Normalizamos el tamaño para que acercarse o alejarse de la cámara
+        # cambie lo menos posible el reconocimiento.
+        scale = max(
+            ((x * x + y * y + z * z) ** 0.5 for x, y, z in centered),
+            default=0.0,
+        )
+        if scale < 1e-6:
+            return None
+
+        vector = []
+        for x, y, z in centered:
+            vector.extend((x / scale, y / scale, z / scale))
+
+        handedness = str(hand.get("handedness", "Unknown")) if isinstance(hand, dict) else "Unknown"
+        handedness_order = 0 if handedness == "Left" else 1 if handedness == "Right" else 2
+        prepared.append(((handedness_order, wx), vector))
+
+    prepared.sort(key=lambda item: item[0])
+
+    final_vector = []
+    for _, vector in prepared:
+        final_vector.extend(vector)
+
+    return {
+        "hand_count": len(prepared),
+        "vector": final_vector,
+    }
+
+
+def _preparar_muestras_reconocimiento(data):
+    """Valida el JSON de entrenamiento y precalcula los vectores de cada muestra."""
+    if not isinstance(data, dict) or not isinstance(data.get("samples"), list):
+        return []
+
+    prepared = []
+    for sample in data["samples"]:
+        if not isinstance(sample, dict):
+            continue
+
+        label = str(sample.get("label", "")).strip().upper()
+        feature = _vector_reconocimiento(sample.get("hands", []))
+        if not label or feature is None:
+            continue
+
+        prepared.append({
+            "label": label,
+            "hand_count": feature["hand_count"],
+            "vector": feature["vector"],
+        })
+
+    return prepared
+
+
+def _sanitizar_nombre_modelo(nombre):
+    """Convierte el nombre visible de una seña en un nombre de archivo seguro."""
+    nombre = str(nombre or "").strip().upper()
+    seguro = "".join(
+        ch if (ch.isalnum() or ch in "-_") else "_"
+        for ch in nombre
+    )
+    seguro = seguro.strip("._-")
+    while "__" in seguro:
+        seguro = seguro.replace("__", "_")
+    return seguro or "SENA"
+
+
+def _ruta_modelo_local(nombre):
+    return LOCAL_TRAINED_MODELS_DIR / f"{_sanitizar_nombre_modelo(nombre)}.json"
+
+
+def _reconstruir_muestras_reconocimiento():
+    """Une modelos externos + modelos locales sin tocar el hilo de cámara."""
+    global recognition_model_samples
+    recognition_model_samples = list(recognition_external_samples) + list(recognition_local_samples)
+    return recognition_model_samples
+
+
+def cargar_modelos_locales_entrenados(mostrar_estado=False):
+    """Carga todos los JSON de modelos_entrenados/ como un solo modelo en memoria."""
+    global recognition_local_samples
+    global recognition_local_files
+
+    LOCAL_TRAINED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    preparados = []
+    archivos_validos = []
+
+    for ruta in sorted(LOCAL_TRAINED_MODELS_DIR.glob("*.json")):
+        try:
+            datos = _leer_json_modelo(ruta)
+            muestras = _preparar_muestras_reconocimiento(datos)
+            if not muestras:
+                continue
+            preparados.extend(muestras)
+            archivos_validos.append(ruta)
+        except Exception:
+            # Un archivo dañado no impide cargar el resto de señas.
+            continue
+
+    recognition_local_samples = preparados
+    recognition_local_files = archivos_validos
+    _reconstruir_muestras_reconocimiento()
+
+    if mostrar_estado:
+        labels = sorted({item["label"] for item in recognition_local_samples})
+        try:
+            set_status(
+                f"Modelos locales: {len(labels)} seña(s), "
+                f"{len(recognition_local_samples)} muestra(s)."
+            )
+        except Exception:
+            pass
+
+    return archivos_validos, preparados
+
+
+def _activar_modelo_online(datos_modelo, ruta_modelo, version=None):
+    """Activa un modelo externo y lo combina con todos los modelos locales."""
+    global loaded_recognition_model_path
+    global loaded_recognition_model_data
+    global recognition_external_samples
+    global model_online_version
+
+    prepared = _preparar_muestras_reconocimiento(datos_modelo)
+    if not prepared:
+        return False
+
+    loaded_recognition_model_data = datos_modelo
+    loaded_recognition_model_path = str(ruta_modelo)
+    recognition_external_samples = prepared
+    _reconstruir_muestras_reconocimiento()
+
+    if version:
+        model_online_version = str(version)
+
+    return True
+
+
+def _leer_json_modelo(ruta):
+    with Path(ruta).open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _leer_manifest_local_modelo():
+    if not MODEL_CACHE_MANIFEST.exists():
+        return {}
+    try:
+        data = _leer_json_modelo(MODEL_CACHE_MANIFEST)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _url_archivo_modelo(nombre_archivo):
+    # Path(...).name evita que un nombre del manifest pueda salir de /modelos/.
+    nombre_seguro = Path(str(nombre_archivo)).name or "modelo_senas.json"
+    return (
+        f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/"
+        f"{MODEL_GITHUB_BRANCH}/{MODEL_GITHUB_FOLDER}/{nombre_seguro}"
+    )
+
+
+def _descargar_modelo_bytes(url, timeout=10):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "ManosQueHablan-ModelSync/1.0",
+            "Accept": "application/json, application/octet-stream;q=0.9, */*;q=0.1",
+            "Cache-Control": "no-cache",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def _guardar_modelo_atomico(ruta, contenido):
+    """Evita dejar un JSON a medias si se corta una descarga."""
+    ruta = Path(ruta)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    temporal = ruta.with_suffix(ruta.suffix + ".part")
+
+    with temporal.open("wb") as fh:
+        fh.write(contenido)
+
+    temporal.replace(ruta)
+
+
+def sincronizar_modelo_github():
+    """
+    Carga el último modelo guardado y luego revisa GitHub en un hilo aparte.
+
+    IMPORTANTE: esta función jamás se ejecuta dentro de process_frames().
+    Por eso Internet no añade latencia al seguimiento de la mano.
+    """
+    global model_sync_in_progress
+
+    if model_sync_in_progress:
+        return
+
+    model_sync_in_progress = True
+
+    def worker():
+        global model_sync_in_progress
+
+        # ------------------------------------------------------
+        # 1. CARGAR CACHÉ LOCAL PRIMERO
+        # ------------------------------------------------------
+        # Esto permite reconocer aunque GitHub esté lento o no haya Internet.
+        if MODEL_CACHE_FILE.exists():
+            try:
+                datos_cache = _leer_json_modelo(MODEL_CACHE_FILE)
+                if _preparar_muestras_reconocimiento(datos_cache):
+                    manifest_cache = _leer_manifest_local_modelo()
+                    version_cache = str(manifest_cache.get("version", "")).strip() or None
+
+                    def aplicar_cache(data=datos_cache, version=version_cache):
+                        _activar_modelo_online(
+                            data,
+                            MODEL_CACHE_FILE,
+                            version=version,
+                        )
+
+                    root.after(0, aplicar_cache)
+            except Exception:
+                # Si la caché está dañada, simplemente intentamos bajar una nueva.
+                pass
+
+        # ------------------------------------------------------
+        # 2. REVISAR GITHUB EN SEGUNDO PLANO
+        # ------------------------------------------------------
+        try:
+            manifest_raw = _descargar_modelo_bytes(MODEL_MANIFEST_URL, timeout=6)
+            manifest = json.loads(manifest_raw.decode("utf-8"))
+
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json no es válido")
+
+            version_remota = str(manifest.get("version", "")).strip()
+            archivo_remoto = str(manifest.get("file", "modelo_senas.json")).strip()
+            sha256_esperado = str(manifest.get("sha256", "")).strip().lower()
+
+            if not version_remota:
+                raise ValueError("manifest.json no contiene la versión del modelo")
+
+            manifest_local = _leer_manifest_local_modelo()
+            version_local = str(manifest_local.get("version", "")).strip()
+
+            # Solo descargamos el modelo cuando falta o cambia la versión.
+            if MODEL_CACHE_FILE.exists() and version_local == version_remota:
+                return
+
+            modelo_url = str(manifest.get("url", "")).strip()
+            if not modelo_url:
+                modelo_url = _url_archivo_modelo(archivo_remoto)
+
+            modelo_raw = _descargar_modelo_bytes(modelo_url, timeout=15)
+
+            # Si en el futuro rellenas sha256 en manifest.json, también se verifica.
+            if sha256_esperado:
+                sha256_real = hashlib.sha256(modelo_raw).hexdigest().lower()
+                if sha256_real != sha256_esperado:
+                    raise ValueError("El SHA-256 del modelo descargado no coincide")
+
+            datos_nuevos = json.loads(modelo_raw.decode("utf-8"))
+            if not _preparar_muestras_reconocimiento(datos_nuevos):
+                raise ValueError("El modelo descargado no contiene muestras válidas")
+
+            # Primero validamos; recién después reemplazamos la caché anterior.
+            _guardar_modelo_atomico(MODEL_CACHE_FILE, modelo_raw)
+            _guardar_modelo_atomico(
+                MODEL_CACHE_MANIFEST,
+                json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+            )
+
+            def aplicar_nuevo(data=datos_nuevos, version=version_remota):
+                if _activar_modelo_online(
+                    data,
+                    MODEL_CACHE_FILE,
+                    version=version,
+                ):
+                    try:
+                        labels = sorted({item["label"] for item in recognition_model_samples})
+                        set_status(
+                            f"Modelo de GitHub v{version} listo · "
+                            f"{len(labels)} seña(s), {len(recognition_model_samples)} muestra(s)."
+                        )
+                    except Exception:
+                        pass
+
+            root.after(0, aplicar_nuevo)
+
+        except Exception:
+            # Sin Internet no bloqueamos la aplicación ni la cámara.
+            # Si existía caché, ya se programó su carga arriba.
+            pass
+        finally:
+            model_sync_in_progress = False
+
+    threading.Thread(
+        target=worker,
+        daemon=True,
+        name="GitHubModelSync",
+    ).start()
+
+
+def reconocer_sena(hands_data):
+    """Reconoce una seña por vecinos cercanos usando las muestras JSON cargadas."""
+    model_samples = recognition_model_samples
+    if not model_samples:
+        return None, 0.0
+
+    feature = _vector_reconocimiento(hands_data)
+    if feature is None:
+        return None, 0.0
+
+    current = feature["vector"]
+    hand_count = feature["hand_count"]
+    distances = []
+
+    for sample in model_samples:
+        if sample["hand_count"] != hand_count:
+            continue
+
+        reference = sample["vector"]
+        if len(reference) != len(current):
+            continue
+
+        # Distancia RMS entre landmarks normalizados.
+        squared = 0.0
+        for a, b in zip(current, reference):
+            diff = a - b
+            squared += diff * diff
+        distance = (squared / max(1, len(current))) ** 0.5
+        distances.append((distance, sample["label"]))
+
+    if not distances:
+        return None, 0.0
+
+    distances.sort(key=lambda item: item[0])
+    nearest = distances[: min(5, len(distances))]
+
+    weights = {}
+    total_weight = 0.0
+    for distance, label in nearest:
+        weight = 1.0 / (distance + 1e-6)
+        weights[label] = weights.get(label, 0.0) + weight
+        total_weight += weight
+
+    winner = max(weights, key=weights.get)
+    winner_distances = [distance for distance, label in nearest if label == winner]
+    nearest_distance = min(winner_distances) if winner_distances else nearest[0][0]
+    agreement = weights[winner] / total_weight if total_weight > 0 else 0.0
+
+    # La confianza combina cercanía geométrica y acuerdo entre vecinos.
+    similarity = max(0.0, min(1.0, 1.0 - (nearest_distance / 0.55)))
+    confidence = (similarity * 0.65 + agreement * 0.35) * 100.0
+
+    # Rechazamos poses demasiado alejadas para no inventar una traducción.
+    if nearest_distance > 0.42 or confidence < 50.0:
+        return None, confidence
+
+    return winner, min(99.0, confidence)
 
 
 # ==========================================================
@@ -305,6 +746,9 @@ def process_frames():
     global mediapipe_fps
     global last_process_time
     global running
+    global latest_recognized_sign
+    global latest_recognition_confidence
+    global latest_recognition_hands_data
 
     processed_id = -1
 
@@ -349,6 +793,7 @@ def process_frames():
         rgb_small.flags.writeable = True
 
         hand_count = 0
+        recognition_hands_data = []
 
         if results.multi_hand_landmarks:
             hand_count = len(results.multi_hand_landmarks)
@@ -381,6 +826,15 @@ def process_frames():
                     hand_key
                 )
 
+                # Copia ligera de los 21 puntos para el modelo de reconocimiento.
+                recognition_hands_data.append({
+                    "handedness": hand_label,
+                    "landmarks": [
+                        {"x": float(lm.x), "y": float(lm.y), "z": float(lm.z)}
+                        for lm in hand_landmarks.landmark
+                    ],
+                })
+
                 mp_drawing.draw_landmarks(
                     frame,
                     hand_landmarks,
@@ -406,6 +860,11 @@ def process_frames():
 
         else:
             landmark_history.clear()
+
+        if recognition_hands_data and recognition_model_samples:
+            recognized_sign, recognition_confidence = reconocer_sena(recognition_hands_data)
+        else:
+            recognized_sign, recognition_confidence = None, 0.0
 
         cv2.putText(
             frame,
@@ -442,6 +901,9 @@ def process_frames():
             latest_processed_frame_id = frame_id
             latest_hand_count = hand_count
             latest_processing_latency_ms = latency_ms
+            latest_recognized_sign = recognized_sign
+            latest_recognition_confidence = recognition_confidence
+            latest_recognition_hands_data = recognition_hands_data
 
         processed_id = frame_id
 
@@ -709,6 +1171,8 @@ def actualizar_video():
                 processed_id = latest_processed_frame_id
                 hand_count = latest_hand_count
                 latency_ms = latest_processing_latency_ms
+                recognized_sign = latest_recognized_sign
+                recognition_confidence = latest_recognition_confidence
             else:
                 frame = None
 
@@ -756,38 +1220,71 @@ def actualizar_video():
                 text=f"{display_fps:.0f} FPS"
             )
 
+            c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+
             if hand_count > 0:
-                detection_value.configure(
-                    text="Detectando",
-                    fg=THEMES.get(current_theme_name, THEMES["Oscuro"])["ok"]
-                )
+                detection_value.configure(text="Detectando", fg=c["ok"])
 
-                if "translation_status_value" in globals():
-                    translation_status_value.configure(
-                        text="Detectando",
-                        fg=THEMES.get(current_theme_name, THEMES["Oscuro"])["ok"]
+                if recognition_model_samples:
+                    if recognized_sign:
+                        if "translation_status_value" in globals():
+                            translation_status_value.configure(
+                                text="Reconocida",
+                                fg=c["ok"],
+                            )
+                        translation_value.configure(
+                            text=recognized_sign,
+                            fg=c["text"],
+                        )
+                        if "translation_confidence_value" in globals():
+                            translation_confidence_value.configure(
+                                text=f"{recognition_confidence:.0f}%"
+                            )
+                    else:
+                        if "translation_status_value" in globals():
+                            translation_status_value.configure(
+                                text="Sin coincidencia",
+                                fg=c["muted"],
+                            )
+                        translation_value.configure(
+                            text="Seña no reconocida",
+                            fg=c["muted"],
+                        )
+                        if "translation_confidence_value" in globals():
+                            translation_confidence_value.configure(
+                                text=(
+                                    f"{recognition_confidence:.0f}%"
+                                    if recognition_confidence > 0
+                                    else "--"
+                                )
+                            )
+                else:
+                    if "translation_status_value" in globals():
+                        translation_status_value.configure(
+                            text="Modelo no cargado",
+                            fg=c["muted"],
+                        )
+                    translation_value.configure(
+                        text="Carga un modelo para reconocer",
+                        fg=c["muted"],
                     )
-
-                translation_value.configure(
-                    text="Mano detectada",
-                    fg=THEMES.get(current_theme_name, THEMES["Oscuro"])["text"]
-                )
+                    if "translation_confidence_value" in globals():
+                        translation_confidence_value.configure(text="--")
             else:
-                detection_value.configure(
-                    text="En espera",
-                    fg=THEMES.get(current_theme_name, THEMES["Oscuro"])["muted"]
-                )
+                detection_value.configure(text="En espera", fg=c["muted"])
 
                 if "translation_status_value" in globals():
                     translation_status_value.configure(
                         text="En espera",
-                        fg=THEMES.get(current_theme_name, THEMES["Oscuro"])["muted"]
+                        fg=c["muted"],
                     )
 
                 translation_value.configure(
                     text="Esperando una seña...",
-                    fg=THEMES.get(current_theme_name, THEMES["Oscuro"])["muted"]
+                    fg=c["muted"],
                 )
+                if "translation_confidence_value" in globals():
+                    translation_confidence_value.configure(text="--")
 
             photo = frame_to_photo(frame)
 
@@ -926,15 +1423,15 @@ def salir_video_fullscreen(event=None):
     # todo el espacio libre.
     if sidebar_active == "Inicio":
         side_panel.grid_remove()
-        main.grid_columnconfigure(0, weight=2, uniform="")
-        main.grid_columnconfigure(1, weight=8, uniform="")
+        main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
+        main.grid_columnconfigure(1, weight=1, uniform="")
         main.grid_columnconfigure(2, weight=0, minsize=0, uniform="")
     else:
         # En Traducir/otras vistas recuperamos la distribución normal.
         side_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
-        main.grid_columnconfigure(0, weight=2, uniform="main_cols")
-        main.grid_columnconfigure(1, weight=6, uniform="main_cols")
-        main.grid_columnconfigure(2, weight=3, minsize=0, uniform="main_cols")
+        main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
+        main.grid_columnconfigure(1, weight=6, uniform="main_content")
+        main.grid_columnconfigure(2, weight=3, minsize=0, uniform="main_content")
 
     draw_fullscreen_icon()
 
@@ -1439,6 +1936,15 @@ def apply_theme(theme_name=None):
     if "translation_value" in globals():
         translation_value.configure(bg=c["card"])
 
+    if "account_panel" in globals():
+        account_panel.configure(bg=c["panel"], highlightbackground=c["border"])
+        account_title.configure(bg=c["panel"], fg=c["text"])
+        account_message.configure(bg=c["panel"], fg=c["muted"])
+        account_url.configure(
+            bg=c["panel"],
+            fg="#11A8FF" if theme_name == "Oscuro" else "#0077C8",
+        )
+
     if "settings_panel" in globals():
         settings_panel.configure(bg=c["panel"], highlightbackground=c["border"])
         appearance_label.configure(bg=c["panel"], fg=c["muted"])
@@ -1446,6 +1952,38 @@ def apply_theme(theme_name=None):
         appearance_row.configure(bg=c["panel"])
         stabilization_row.configure(bg=c["panel"])
         settings_separator.configure(bg=c["border"])
+        if "training_separator" in globals():
+            training_separator.configure(bg=c["border"])
+        if "training_label" in globals():
+            training_label.configure(bg=c["panel"], fg=c["muted"])
+        if "training_actions" in globals():
+            training_actions.configure(bg=c["panel"])
+        if "training_button" in globals():
+            training_button.configure(
+                bg=c["button"], fg=c["text"],
+                activebackground=c["button_active"], activeforeground=c["text"],
+                highlightbackground=c["border"],
+            )
+        if "load_model_button" in globals():
+            load_model_button.configure(
+                bg=c["button"], fg=c["text"],
+                activebackground=c["button_active"], activeforeground=c["text"],
+                highlightbackground=c["border"],
+            )
+        if "model_extra_actions" in globals():
+            model_extra_actions.configure(bg=c["panel"])
+        if "search_models_button" in globals():
+            search_models_button.configure(
+                bg=c["button"], fg=c["text"],
+                activebackground=c["button_active"], activeforeground=c["text"],
+                highlightbackground=c["border"],
+            )
+        if "delete_models_button" in globals():
+            delete_models_button.configure(
+                bg=c["button"], fg=c["text"],
+                activebackground=c["button_active"], activeforeground=c["text"],
+                highlightbackground=c["border"],
+            )
         if "updates_separator" in globals():
             updates_separator.configure(bg=c["border"])
         if "updates_label" in globals():
@@ -1666,6 +2204,7 @@ header_controls.pack(side="right", padx=14, pady=5)
 theme_var = tk.StringVar(value="Sistema")
 stabilization_var = tk.StringVar(value="Baja")
 settings_panel_visible = False
+account_panel_visible = False
 settings_theme_buttons = {}
 settings_stab_buttons = {}
 
@@ -1720,12 +2259,63 @@ def cerrar_panel_ajustes():
     settings_panel_visible = False
 
 
+def cerrar_panel_cuenta():
+    """Oculta el panel de contribución del icono de Cuenta."""
+    global account_panel_visible
+
+    if "account_panel" in globals():
+        account_panel.place_forget()
+
+    account_panel_visible = False
+
+
+def abrir_github_contribucion():
+    """Abre el repositorio del proyecto en el navegador predeterminado."""
+    try:
+        webbrowser.open_new_tab(GITHUB_PROJECT_URL)
+    except Exception as exc:
+        messagebox.showerror(
+            "No se pudo abrir GitHub",
+            f"No se pudo abrir el enlace.\n\n{GITHUB_PROJECT_URL}\n\n{exc}",
+        )
+
+
+def toggle_panel_cuenta():
+    """Muestra u oculta la tarjeta para contribuir al proyecto."""
+    global account_panel_visible
+
+    if account_panel_visible:
+        cerrar_panel_cuenta()
+        return
+
+    # Evita que Cuenta y Ajustes aparezcan superpuestos.
+    if globals().get("settings_panel_visible", False):
+        cerrar_panel_ajustes()
+
+    if "account_panel" not in globals():
+        return
+
+    account_panel.place(
+        relx=1.0,
+        x=-58,
+        y=68,
+        anchor="ne",
+        width=370,
+    )
+    account_panel.lift()
+    account_panel_visible = True
+
+
 def toggle_panel_ajustes():
     global settings_panel_visible
 
     if settings_panel_visible:
         cerrar_panel_ajustes()
         return
+
+    # Evita que Ajustes y Cuenta aparezcan superpuestos.
+    if globals().get("account_panel_visible", False):
+        cerrar_panel_cuenta()
 
     # Tarjeta flotante dentro de la propia ventana, alineada al engranaje.
     settings_panel.place(
@@ -1738,6 +2328,1046 @@ def toggle_panel_ajustes():
     settings_panel.lift()
     settings_panel_visible = True
     update_settings_controls()
+
+
+
+
+def buscar_modelos_internet():
+    """Abre en GitHub la carpeta pública donde se distribuyen los modelos."""
+    cerrar_panel_ajustes()
+
+    try:
+        webbrowser.open_new_tab(GITHUB_MODELS_PAGE_URL)
+        set_status("Abriendo modelos disponibles en GitHub...")
+    except Exception as exc:
+        messagebox.showerror(
+            "No se pudo abrir GitHub",
+            f"No se pudo abrir la página de modelos.\n\n{GITHUB_MODELS_PAGE_URL}\n\n{exc}",
+            parent=root,
+        )
+
+
+def eliminar_modelos_reconocimiento():
+    """Permite borrar señas locales individualmente y quitar modelos externos/caché."""
+    cerrar_panel_ajustes()
+    LOCAL_TRAINED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    cargar_modelos_locales_entrenados()
+
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    win = tk.Toplevel(root)
+    win.title("Eliminar modelos · Manos que Hablan")
+    win.geometry("520x430")
+    win.minsize(460, 360)
+    win.configure(bg=c["bg"])
+    win.transient(root)
+    win.grab_set()
+
+    shell = tk.Frame(
+        win, bg=c["panel"], highlightthickness=1,
+        highlightbackground=c["border"],
+    )
+    shell.pack(fill="both", expand=True, padx=16, pady=16)
+
+    tk.Label(
+        shell, text="Eliminar modelos", bg=c["panel"], fg=c["text"],
+        font=("DejaVu Sans", 15, "bold"), anchor="w",
+    ).pack(fill="x", padx=16, pady=(15, 3))
+
+    tk.Label(
+        shell,
+        text="Selecciona una o varias señas entrenadas localmente. Cada seña corresponde a un archivo JSON independiente.",
+        bg=c["panel"], fg=c["muted"], font=("DejaVu Sans", 9),
+        anchor="w", justify="left", wraplength=450,
+    ).pack(fill="x", padx=16, pady=(0, 10))
+
+    list_frame = tk.Frame(shell, bg=c["panel_alt"])
+    list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+
+    scrollbar = tk.Scrollbar(list_frame)
+    scrollbar.pack(side="right", fill="y")
+
+    listbox = tk.Listbox(
+        list_frame,
+        selectmode="extended",
+        yscrollcommand=scrollbar.set,
+        bg=c["button"], fg=c["text"],
+        selectbackground=c["accent"], selectforeground=c["accent_text"],
+        relief="flat", bd=0, highlightthickness=1,
+        highlightbackground=c["border"],
+        font=("DejaVu Sans", 10),
+    )
+    listbox.pack(side="left", fill="both", expand=True)
+    scrollbar.configure(command=listbox.yview)
+
+    rutas = list(recognition_local_files)
+    for ruta in rutas:
+        try:
+            datos = _leer_json_modelo(ruta)
+            cantidad = len(datos.get("samples", [])) if isinstance(datos, dict) else 0
+        except Exception:
+            cantidad = 0
+        listbox.insert("end", f"{ruta.stem}   ·   {cantidad} muestras")
+
+    if not rutas:
+        listbox.insert("end", "No hay señas locales guardadas")
+        listbox.configure(state="disabled")
+
+    def borrar_seleccionados():
+        indices = list(listbox.curselection())
+        if not indices or not rutas:
+            messagebox.showinfo(
+                "Selecciona un modelo",
+                "Selecciona al menos una seña de la lista.",
+                parent=win,
+            )
+            return
+
+        nombres = [rutas[i].stem for i in indices if i < len(rutas)]
+        if not messagebox.askyesno(
+            "Confirmar eliminación",
+            "¿Eliminar estos modelos?\n\n" + "\n".join(f"• {n}" for n in nombres) +
+            "\n\nEsta acción borra sus archivos JSON de modelos_entrenados/.",
+            parent=win,
+        ):
+            return
+
+        errores = []
+        for i in sorted(indices, reverse=True):
+            if i >= len(rutas):
+                continue
+            try:
+                rutas[i].unlink(missing_ok=True)
+            except Exception as exc:
+                errores.append(f"{rutas[i].name}: {exc}")
+
+        cargar_modelos_locales_entrenados(mostrar_estado=True)
+        if errores:
+            messagebox.showwarning(
+                "Eliminación parcial",
+                "Algunos archivos no se pudieron borrar:\n\n" + "\n".join(errores),
+                parent=win,
+            )
+        else:
+            messagebox.showinfo(
+                "Modelos eliminados",
+                "Los modelos seleccionados fueron eliminados.",
+                parent=win,
+            )
+        win.destroy()
+
+    def quitar_externos():
+        global loaded_recognition_model_path
+        global loaded_recognition_model_data
+        global recognition_external_samples
+        global model_online_version
+        global latest_recognized_sign
+        global latest_recognition_confidence
+
+        hay_externo = bool(recognition_external_samples or loaded_recognition_model_path)
+        hay_cache = MODEL_CACHE_FILE.exists() or MODEL_CACHE_MANIFEST.exists()
+        if not hay_externo and not hay_cache:
+            messagebox.showinfo(
+                "Sin modelo externo",
+                "No hay un modelo externo activo ni caché de GitHub para quitar.",
+                parent=win,
+            )
+            return
+
+        if not messagebox.askyesno(
+            "Quitar modelo externo",
+            "Se quitará el modelo cargado manualmente/GitHub y su caché.\n\n"
+            "Tus JSON de modelos_entrenados/ NO se borrarán.",
+            parent=win,
+        ):
+            return
+
+        loaded_recognition_model_path = None
+        loaded_recognition_model_data = None
+        recognition_external_samples = []
+        model_online_version = None
+        latest_recognized_sign = None
+        latest_recognition_confidence = 0.0
+        _reconstruir_muestras_reconocimiento()
+
+        errores = []
+        for ruta_cache in (MODEL_CACHE_FILE, MODEL_CACHE_MANIFEST):
+            try:
+                ruta_cache.unlink(missing_ok=True)
+            except Exception as exc:
+                errores.append(f"{ruta_cache.name}: {exc}")
+
+        if errores:
+            messagebox.showwarning(
+                "Caché parcial",
+                "El modelo se quitó, pero algunos archivos no pudieron borrarse:\n\n" + "\n".join(errores),
+                parent=win,
+            )
+        else:
+            messagebox.showinfo(
+                "Modelo externo quitado",
+                "El modelo externo fue quitado. Los modelos locales siguen activos.",
+                parent=win,
+            )
+        set_status("Modelo externo quitado; modelos locales conservados.")
+
+    buttons = tk.Frame(shell, bg=c["panel"])
+    buttons.pack(fill="x", padx=16, pady=(0, 15))
+
+    tk.Button(
+        buttons, text="Eliminar seleccionados", command=borrar_seleccionados,
+        relief="flat", bd=0, bg=c["accent"], fg=c["accent_text"],
+        activebackground=c["button_active"], activeforeground=c["text"],
+        font=("DejaVu Sans", 9, "bold"), padx=10, pady=9, cursor="hand2",
+    ).pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+    tk.Button(
+        buttons, text="Quitar externo / caché", command=quitar_externos,
+        relief="flat", bd=0, bg=c["button"], fg=c["text"],
+        activebackground=c["button_active"], activeforeground=c["text"],
+        font=("DejaVu Sans", 9, "bold"), padx=10, pady=9, cursor="hand2",
+    ).pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+
+def cargar_modelo_reconocimiento():
+    """Carga uno o varios JSON externos y los combina con modelos_entrenados/."""
+    global loaded_recognition_model_path
+    global loaded_recognition_model_data
+    global recognition_external_samples
+
+    cerrar_panel_ajustes()
+
+    rutas = filedialog.askopenfilenames(
+        parent=root,
+        title="Cargar uno o varios modelos de reconocimiento",
+        filetypes=[
+            ("Modelos de reconocimiento JSON", "*.json"),
+            ("Todos los archivos", "*.*"),
+        ],
+    )
+
+    if not rutas:
+        return
+
+    preparados_externos = []
+    muestras_raw = []
+    nombres_cargados = []
+    errores = []
+
+    try:
+        local_dir = LOCAL_TRAINED_MODELS_DIR.resolve()
+    except Exception:
+        local_dir = LOCAL_TRAINED_MODELS_DIR
+
+    for ruta in rutas:
+        ruta_modelo = Path(ruta)
+        if ruta_modelo.suffix.lower() != ".json":
+            errores.append(f"{ruta_modelo.name}: formato no compatible")
+            continue
+
+        try:
+            datos_modelo = _leer_json_modelo(ruta_modelo)
+            prepared = _preparar_muestras_reconocimiento(datos_modelo)
+            if not prepared:
+                errores.append(f"{ruta_modelo.name}: no contiene muestras válidas")
+                continue
+
+            # Los archivos dentro de modelos_entrenados/ ya se cargan automáticamente,
+            # así evitamos duplicar su peso al seleccionarlos manualmente.
+            try:
+                es_local = ruta_modelo.resolve().parent == local_dir
+            except Exception:
+                es_local = False
+
+            if not es_local:
+                preparados_externos.extend(prepared)
+                if isinstance(datos_modelo, dict):
+                    muestras_raw.extend(datos_modelo.get("samples", []))
+            nombres_cargados.append(ruta_modelo.name)
+        except Exception as exc:
+            errores.append(f"{ruta_modelo.name}: {exc}")
+
+    cargar_modelos_locales_entrenados()
+
+    if not nombres_cargados:
+        messagebox.showerror(
+            "Modelos no válidos",
+            "No se pudo cargar ningún modelo válido.\n\n" + "\n".join(errores),
+            parent=root,
+        )
+        return
+
+    recognition_external_samples = preparados_externos
+    loaded_recognition_model_data = {"version": 1, "samples": muestras_raw}
+    loaded_recognition_model_path = "; ".join(nombres_cargados)
+    _reconstruir_muestras_reconocimiento()
+
+    labels = sorted({item["label"] for item in recognition_model_samples})
+    set_status(
+        f"Modelos listos: {len(labels)} seña(s), {len(recognition_model_samples)} muestra(s)."
+    )
+
+    aviso = (
+        f"Modelos seleccionados: {len(nombres_cargados)}\n"
+        f"Señas activas totales: {len(labels)}\n"
+        f"Muestras activas totales: {len(recognition_model_samples)}"
+    )
+    if errores:
+        aviso += "\n\nAlgunos archivos se omitieron:\n" + "\n".join(errores[:8])
+
+    messagebox.showinfo(
+        "Modelos cargados",
+        aviso + "\n\nLos modelos locales y externos se combinan en memoria para traducir.",
+        parent=root,
+    )
+
+
+def abrir_ventana_entrenamiento():
+    """Abre una ventana con cámara en vivo y opciones avanzadas de captura."""
+    cerrar_panel_ajustes()
+
+    # Evita abrir varias ventanas de entrenamiento al mismo tiempo.
+    existente = globals().get("training_window")
+    try:
+        if existente is not None and existente.winfo_exists():
+            existente.lift()
+            existente.focus_force()
+            return
+    except tk.TclError:
+        pass
+
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    win = tk.Toplevel(root)
+    globals()["training_window"] = win
+    win.title("Entrenar modelo · Manos que Hablan")
+    win.geometry("1180x720")
+    win.minsize(980, 640)
+    win.configure(bg=c["bg"])
+    win.transient(root)
+
+    container = tk.Frame(
+        win,
+        bg=c["panel"],
+        highlightthickness=1,
+        highlightbackground=c["border"],
+    )
+    container.pack(fill="both", expand=True, padx=18, pady=18)
+
+    title = tk.Label(
+        container,
+        text="Entrenar modelo",
+        bg=c["panel"], fg=c["text"],
+        font=("DejaVu Sans", 16, "bold"), anchor="w",
+    )
+    title.pack(fill="x", padx=20, pady=(18, 2))
+
+    subtitle = tk.Label(
+        container,
+        text="Mira la cámara en vivo y registra ejemplos de cada seña con la cantidad y velocidad que prefieras.",
+        bg=c["panel"], fg=c["muted"],
+        font=("DejaVu Sans", 9), anchor="w", justify="left",
+    )
+    subtitle.pack(fill="x", padx=20, pady=(0, 10))
+
+    # ----------------------------------------------------------
+    # DISTRIBUCIÓN DE ENTRENAMIENTO
+    # Controles a la izquierda + cámara grande a la derecha.
+    # ----------------------------------------------------------
+    workspace = tk.Frame(container, bg=c["panel"])
+    workspace.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+
+    controls_panel = tk.Frame(
+        workspace,
+        bg=c["panel"],
+        width=380,
+    )
+    controls_panel.pack(side="left", fill="y", padx=(0, 14))
+    controls_panel.pack_propagate(False)
+
+    # ----------------------------------------------------------
+    # CÁMARA EN VIVO DE ENTRENAMIENTO
+    # Reutiliza el frame YA procesado por la cámara principal.
+    # No abre una segunda cámara ni un segundo MediaPipe.
+    # ----------------------------------------------------------
+    preview_shell = tk.Frame(
+        workspace,
+        bg=c["panel_alt"],
+        highlightthickness=1,
+        highlightbackground=c["border"],
+    )
+    preview_shell.pack(side="right", fill="both", expand=True)
+
+    preview_label = tk.Label(
+        preview_shell,
+        text="Iniciando cámara de entrenamiento...",
+        bg=c["camera_bg"],
+        fg=c["muted"],
+        font=("DejaVu Sans", 10),
+        anchor="center",
+    )
+    preview_label.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+
+    preview_info_var = tk.StringVar(value="CÁMARA EN VIVO")
+    preview_info = tk.Label(
+        preview_shell,
+        textvariable=preview_info_var,
+        bg=c["panel_alt"], fg=c["muted"],
+        font=("DejaVu Sans", 8, "bold"), anchor="w",
+    )
+    preview_info.pack(fill="x", padx=10, pady=7)
+
+    # ----------------------------------------------------------
+    # NOMBRE + CONTADOR
+    # ----------------------------------------------------------
+    form_row = tk.Frame(controls_panel, bg=c["panel"])
+    form_row.pack(fill="x", pady=(0, 10))
+
+    name_box = tk.Frame(form_row, bg=c["panel"])
+    name_box.pack(fill="x")
+
+    name_label = tk.Label(
+        name_box,
+        text="NOMBRE DE LA SEÑA",
+        bg=c["panel"], fg=c["muted"],
+        font=("DejaVu Sans", 8, "bold"), anchor="w",
+    )
+    name_label.pack(fill="x", pady=(0, 5))
+
+    sign_name_var = tk.StringVar()
+    sign_entry = tk.Entry(
+        name_box,
+        textvariable=sign_name_var,
+        bg=c["button"], fg=c["text"], insertbackground=c["text"],
+        relief="flat", bd=0, highlightthickness=1,
+        highlightbackground=c["border"], highlightcolor=c["accent"],
+        font=("DejaVu Sans", 11),
+    )
+    sign_entry.pack(fill="x", ipady=8)
+    sign_entry.focus_set()
+
+    info_frame = tk.Frame(
+        form_row,
+        bg=c["panel_alt"],
+        highlightthickness=1,
+        highlightbackground=c["border"],
+    )
+    info_frame.pack(fill="x", pady=(10, 0))
+
+    samples_var = tk.StringVar(value="Muestras guardadas: 0")
+    samples_label = tk.Label(
+        info_frame,
+        textvariable=samples_var,
+        bg=c["panel_alt"], fg=c["text"],
+        font=("DejaVu Sans", 9, "bold"), anchor="w",
+    )
+    samples_label.pack(fill="x", padx=12, pady=(9, 2))
+
+    LOCAL_TRAINED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    file_label = tk.Label(
+        info_frame,
+        text="Archivo: escribe el nombre de la seña",
+        bg=c["panel_alt"], fg=c["muted"],
+        font=("DejaVu Sans", 8), anchor="w",
+    )
+    file_label.pack(fill="x", padx=12, pady=(0, 9))
+
+    # ----------------------------------------------------------
+    # OPCIONES DE CAPTURA
+    # ----------------------------------------------------------
+    options_shell = tk.Frame(
+        controls_panel,
+        bg=c["panel_alt"],
+        highlightthickness=1,
+        highlightbackground=c["border"],
+    )
+    options_shell.pack(fill="x", pady=(0, 10))
+
+    options_title = tk.Label(
+        options_shell,
+        text="OPCIONES DE CAPTURA",
+        bg=c["panel_alt"], fg=c["muted"],
+        font=("DejaVu Sans", 8, "bold"), anchor="w",
+    )
+    options_title.pack(fill="x", padx=12, pady=(9, 7))
+
+    options_row = tk.Frame(options_shell, bg=c["panel_alt"])
+    options_row.pack(fill="x", padx=12, pady=(0, 11))
+
+    cantidad_var = tk.StringVar(value="30")
+    velocidad_var = tk.StringVar(value="Máxima")
+    countdown_var = tk.StringVar(value="0 s")
+    hand_filter_var = tk.StringVar(value="Todas")
+
+    def crear_opcion(parent, titulo_opcion, variable, valores, pad=(0, 8)):
+        box = tk.Frame(parent, bg=c["panel_alt"])
+        box.pack(fill="x", pady=(0, 7))
+        lbl = tk.Label(
+            box,
+            text=titulo_opcion,
+            bg=c["panel_alt"], fg=c["muted"],
+            font=("DejaVu Sans", 8, "bold"), anchor="w",
+        )
+        lbl.pack(fill="x", pady=(0, 4))
+        combo = ttk.Combobox(
+            box,
+            textvariable=variable,
+            values=valores,
+            state="readonly",
+            style="Dashboard.TCombobox",
+        )
+        combo.pack(fill="x")
+        return combo
+
+    cantidad_combo = crear_opcion(
+        options_row, "CANTIDAD", cantidad_var,
+        ("10", "30", "50", "100", "200"),
+        (0, 6),
+    )
+    velocidad_combo = crear_opcion(
+        options_row, "VELOCIDAD", velocidad_var,
+        ("Máxima", "Rápida", "Normal"),
+        (6, 6),
+    )
+    countdown_combo = crear_opcion(
+        options_row, "CUENTA REGRESIVA", countdown_var,
+        ("0 s", "3 s", "5 s"),
+        (6, 6),
+    )
+    hand_filter_combo = crear_opcion(
+        options_row, "MANOS", hand_filter_var,
+        ("Todas", "Izquierda", "Derecha"),
+        (6, 0),
+    )
+
+    status_var = tk.StringVar(
+        value="Escribe el nombre de la seña, elige las opciones y mantén la mano visible."
+    )
+    status_label_training = tk.Label(
+        controls_panel,
+        textvariable=status_var,
+        bg=c["panel"], fg=c["muted"],
+        font=("DejaVu Sans", 9),
+        anchor="w", justify="left", wraplength=360,
+    )
+    status_label_training.pack(fill="x", pady=(0, 4))
+
+    progress_var = tk.StringVar(value="Listo para capturar")
+    progress_label = tk.Label(
+        controls_panel,
+        textvariable=progress_var,
+        bg=c["panel"], fg=c["text"],
+        font=("DejaVu Sans", 9, "bold"),
+        anchor="w",
+    )
+    progress_label.pack(fill="x", pady=(0, 8))
+
+    def cargar_dataset(nombre=None):
+        nombre = (nombre or sign_name_var.get()).strip().upper()
+        if not nombre:
+            return {"version": 1, "label": "", "samples": []}
+
+        ruta = _ruta_modelo_local(nombre)
+        if not ruta.exists():
+            return {"version": 1, "label": nombre, "samples": []}
+
+        try:
+            data = _leer_json_modelo(ruta)
+            if not isinstance(data, dict) or not isinstance(data.get("samples"), list):
+                return {"version": 1, "label": nombre, "samples": []}
+
+            # Cada archivo debe representar una sola seña.
+            samples = [
+                item for item in data["samples"]
+                if isinstance(item, dict) and str(item.get("label", "")).strip().upper() == nombre
+            ]
+            return {"version": int(data.get("version", 1)), "label": nombre, "samples": samples}
+        except Exception:
+            return {"version": 1, "label": nombre, "samples": []}
+
+    def guardar_dataset(data, nombre=None):
+        nombre = (nombre or sign_name_var.get()).strip().upper()
+        if not nombre:
+            raise ValueError("La seña no tiene nombre")
+
+        ruta = _ruta_modelo_local(nombre)
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+
+        # Forzamos que este JSON contenga únicamente muestras de esta seña.
+        samples = []
+        for sample in data.get("samples", []):
+            if not isinstance(sample, dict):
+                continue
+            sample = dict(sample)
+            sample["label"] = nombre
+            samples.append(sample)
+
+        salida = {
+            "version": 1,
+            "label": nombre,
+            "samples": samples,
+        }
+        temporal = ruta.with_suffix(".json.part")
+        with temporal.open("w", encoding="utf-8") as fh:
+            json.dump(salida, fh, ensure_ascii=False, indent=2)
+        temporal.replace(ruta)
+
+        # Refresca todos los JSON locales en memoria; la cámara no se reinicia.
+        cargar_modelos_locales_entrenados()
+        return ruta
+
+    def actualizar_contador(data=None):
+        nombre = sign_name_var.get().strip().upper()
+        if not nombre:
+            samples_var.set("Muestras guardadas: 0")
+            file_label.configure(text="Archivo: escribe el nombre de la seña")
+            return
+
+        ruta = _ruta_modelo_local(nombre)
+        file_label.configure(text=f"Archivo: modelos_entrenados/{ruta.name}")
+        if data is None:
+            data = cargar_dataset(nombre)
+        total = len(data.get("samples", []))
+        samples_var.set(f"Muestras de {nombre}: {total}")
+
+    def copiar_manos(hands_data):
+        """Copia únicamente los datos necesarios de los landmarks ya procesados."""
+        copied = []
+        for hand in hands_data or []:
+            landmarks = hand.get("landmarks", [])
+            if len(landmarks) != 21:
+                continue
+            copied.append({
+                "handedness": str(hand.get("handedness", "Unknown")),
+                "landmarks": [
+                    {
+                        "x": float(lm["x"]),
+                        "y": float(lm["y"]),
+                        "z": float(lm["z"]),
+                    }
+                    for lm in landmarks
+                ],
+            })
+        return copied
+
+    def filtrar_manos(hands_snapshot, filtro):
+        if filtro == "Todas":
+            return hands_snapshot
+
+        objetivo = "left" if filtro == "Izquierda" else "right"
+        return [
+            hand for hand in hands_snapshot
+            if str(hand.get("handedness", "")).strip().lower() == objetivo
+        ]
+
+    def obtener_muestra_actual(nombre, filtro="Todas"):
+        """Toma la muestra del último frame YA procesado por MediaPipe."""
+        with lock:
+            frame_id = latest_processed_frame_id
+            hands_snapshot = copiar_manos(latest_recognition_hands_data)
+
+        hands_snapshot = filtrar_manos(hands_snapshot, filtro)
+
+        if frame_id < 0 or not hands_snapshot:
+            return None, frame_id
+
+        return {
+            "label": nombre,
+            "timestamp": time.time(),
+            "hands": hands_snapshot,
+        }, frame_id
+
+    # ----------------------------------------------------------
+    # PREVIEW RÁPIDO: solo redibuja cuando existe un frame nuevo.
+    # ----------------------------------------------------------
+    preview_state = {"last_frame_id": -1, "after_id": None}
+
+    def convertir_preview(frame):
+        if frame is None:
+            return None
+
+        h, w = frame.shape[:2]
+        available_w = max(320, preview_label.winfo_width() - 4)
+        available_h = max(220, preview_label.winfo_height() - 4)
+        scale = min(available_w / max(1, w), available_h / max(1, h), 1.0)
+        nw = max(1, int(w * scale))
+        nh = max(1, int(h * scale))
+
+        if nw != w or nh != h:
+            view = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+        else:
+            view = frame
+
+        ok, buffer = cv2.imencode(".ppm", view)
+        if not ok:
+            return None
+        return tk.PhotoImage(data=buffer.tobytes())
+
+    def actualizar_preview():
+        try:
+            if not win.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        with lock:
+            frame_id = latest_processed_frame_id
+            frame = (
+                None
+                if latest_processed_frame is None or frame_id == preview_state["last_frame_id"]
+                else latest_processed_frame.copy()
+            )
+            hand_count = latest_hand_count
+
+        if frame is not None:
+            preview_state["last_frame_id"] = frame_id
+            photo = convertir_preview(frame)
+            if photo is not None:
+                preview_label.configure(image=photo, text="")
+                preview_label.image = photo
+            preview_info_var.set(
+                f"CÁMARA EN VIVO  •  {hand_count} mano(s)  •  {mediapipe_fps:.0f} FPS"
+            )
+        elif not running:
+            preview_label.configure(image="", text="La cámara está detenida")
+            preview_label.image = None
+            preview_info_var.set("CÁMARA EN VIVO  •  cámara detenida")
+
+        preview_state["after_id"] = win.after(15, actualizar_preview)
+
+    # ----------------------------------------------------------
+    # CAPTURA AVANZADA
+    # ----------------------------------------------------------
+    capture_job = {
+        "running": False,
+        "mode": "",
+        "target": 0,
+        "captured": 0,
+        "last_frame_id": -1,
+        "last_saved_time": 0.0,
+        "min_interval": 0.0,
+        "label": "",
+        "hand_filter": "Todas",
+        "data": None,
+        "after_id": None,
+        "countdown_after_id": None,
+    }
+
+    def intervalo_seleccionado():
+        # Máxima = guarda cada nuevo frame que publique MediaPipe.
+        # Las otras opciones separan un poco las muestras para dar más variedad temporal.
+        return {
+            "Máxima": 0.0,
+            "Rápida": 0.035,
+            "Normal": 0.080,
+        }.get(velocidad_var.get(), 0.0)
+
+    def segundos_countdown():
+        try:
+            return int(countdown_var.get().split()[0])
+        except (ValueError, IndexError):
+            return 0
+
+    def actualizar_texto_lote(*_):
+        if not capture_job["running"]:
+            try:
+                capture_many.configure(text=f"Capturar {int(cantidad_var.get())} muestras")
+            except Exception:
+                try:
+                    capture_many.configure(text="Capturar lote")
+                except Exception:
+                    pass
+
+    def capturar_muestra_unica():
+        if capture_job["running"]:
+            status_var.set("Detén la captura actual antes de guardar una muestra individual.")
+            return False
+
+        nombre = sign_name_var.get().strip().upper()
+        if not nombre:
+            status_var.set("Primero escribe el nombre de la seña.")
+            return False
+
+        filtro = hand_filter_var.get()
+        sample, frame_id = obtener_muestra_actual(nombre, filtro)
+        if sample is None:
+            if not running:
+                status_var.set("La cámara está detenida. Iníciala para registrar la seña.")
+            else:
+                status_var.set(
+                    f"No detecté la mano seleccionada ({filtro.lower()}) en el último frame."
+                )
+            return False
+
+        try:
+            data = cargar_dataset(nombre)
+            data["samples"].append(sample)
+            guardar_dataset(data, nombre)
+            actualizar_contador(data)
+            progress_var.set("1 muestra guardada")
+            status_var.set(f"Muestra de {nombre} guardada · frame {frame_id}.")
+            return True
+        except Exception as exc:
+            status_var.set(f"No se pudo guardar la muestra: {exc}")
+            return False
+
+    def restaurar_botones():
+        try:
+            capture_many.configure(text=f"Capturar {int(cantidad_var.get())} muestras")
+            capture_continuous.configure(text="Captura continua")
+            capture_one.configure(state="normal")
+        except tk.TclError:
+            pass
+
+    def terminar_captura(cancelado=False):
+        if not capture_job["running"] and not cancelado:
+            return
+
+        # Cancela una cuenta regresiva pendiente si existe.
+        countdown_after_id = capture_job.get("countdown_after_id")
+        if countdown_after_id:
+            try:
+                win.after_cancel(countdown_after_id)
+            except tk.TclError:
+                pass
+            capture_job["countdown_after_id"] = None
+
+        data = capture_job.get("data")
+        captured = capture_job.get("captured", 0)
+        nombre = capture_job.get("label", "")
+        mode = capture_job.get("mode", "")
+        capture_job["running"] = False
+
+        try:
+            if data is not None and captured > 0:
+                guardar_dataset(data, nombre)
+                actualizar_contador(data)
+        except Exception as exc:
+            status_var.set(f"No se pudo guardar la captura: {exc}")
+            restaurar_botones()
+            return
+
+        restaurar_botones()
+        if cancelado:
+            status_var.set(f"Captura detenida. Se guardaron {captured} muestras de {nombre}.")
+        elif mode == "continuous":
+            status_var.set(f"Captura continua terminada: {captured} muestras de {nombre}.")
+        else:
+            status_var.set(f"Serie terminada: {captured} muestras de {nombre} guardadas.")
+        progress_var.set(f"Guardadas en esta serie: {captured}")
+
+    def capturar_paso():
+        if not capture_job["running"]:
+            return
+
+        if capture_job["mode"] == "batch" and capture_job["captured"] >= capture_job["target"]:
+            terminar_captura(cancelado=False)
+            return
+
+        nombre = capture_job["label"]
+        sample, frame_id = obtener_muestra_actual(nombre, capture_job["hand_filter"])
+
+        # Nunca repetimos un mismo frame procesado.
+        if frame_id == capture_job["last_frame_id"]:
+            capture_job["after_id"] = win.after(1, capturar_paso)
+            return
+
+        capture_job["last_frame_id"] = frame_id
+        now = time.perf_counter()
+
+        if sample is not None:
+            elapsed = now - capture_job["last_saved_time"]
+            if capture_job["last_saved_time"] == 0.0 or elapsed >= capture_job["min_interval"]:
+                capture_job["data"]["samples"].append(sample)
+                capture_job["captured"] += 1
+                capture_job["last_saved_time"] = now
+
+                if capture_job["mode"] == "batch":
+                    progress_var.set(
+                        f"Capturando: {capture_job['captured']}/{capture_job['target']}"
+                    )
+                    status_var.set(
+                        f"{velocidad_var.get()} · {capture_job['hand_filter']} · "
+                        f"faltan {max(0, capture_job['target'] - capture_job['captured'])}"
+                    )
+                else:
+                    progress_var.set(
+                        f"Captura continua: {capture_job['captured']} muestras"
+                    )
+                    status_var.set(
+                        f"Capturando sin límite · {velocidad_var.get()} · "
+                        "pulsa Detener cuando tengas suficientes muestras."
+                    )
+        else:
+            progress_var.set(f"Capturadas: {capture_job['captured']} · esperando mano")
+            status_var.set(
+                f"Esperando la mano seleccionada: {capture_job['hand_filter'].lower()}..."
+            )
+
+        capture_job["after_id"] = win.after(1, capturar_paso)
+
+    def comenzar_captura_real():
+        if not capture_job["running"]:
+            return
+
+        capture_job["countdown_after_id"] = None
+        capture_job["last_frame_id"] = -1
+        capture_job["last_saved_time"] = 0.0
+        if capture_job["mode"] == "batch":
+            progress_var.set(f"Capturando: 0/{capture_job['target']}")
+            status_var.set(
+                "Capturando frames nuevos. Mantén la seña y haz pequeños cambios de posición."
+            )
+        else:
+            progress_var.set("Captura continua: 0 muestras")
+            status_var.set("Captura continua iniciada. Pulsa Detener cuando quieras terminar.")
+        capturar_paso()
+
+    def ejecutar_countdown(restante):
+        if not capture_job["running"]:
+            return
+        if restante <= 0:
+            progress_var.set("¡Capturando!")
+            comenzar_captura_real()
+            return
+
+        progress_var.set(f"Comienza en {restante}...")
+        status_var.set("Prepara la seña frente a la cámara.")
+        capture_job["countdown_after_id"] = win.after(
+            1000, lambda: ejecutar_countdown(restante - 1)
+        )
+
+    def preparar_captura(mode):
+        if capture_job["running"]:
+            terminar_captura(cancelado=True)
+            return
+
+        nombre = sign_name_var.get().strip().upper()
+        if not nombre:
+            status_var.set("Primero escribe el nombre de la seña.")
+            return
+        if not running:
+            status_var.set("La cámara está detenida. Iníciala para comenzar la captura.")
+            return
+
+        try:
+            target = int(cantidad_var.get()) if mode == "batch" else 0
+        except ValueError:
+            target = 30
+
+        capture_job["running"] = True
+        capture_job["mode"] = mode
+        capture_job["target"] = target
+        capture_job["captured"] = 0
+        capture_job["last_frame_id"] = -1
+        capture_job["last_saved_time"] = 0.0
+        capture_job["min_interval"] = intervalo_seleccionado()
+        capture_job["label"] = nombre
+        capture_job["hand_filter"] = hand_filter_var.get()
+        capture_job["data"] = cargar_dataset(nombre)
+
+        capture_one.configure(state="disabled")
+        if mode == "batch":
+            capture_many.configure(text="Detener captura")
+            capture_continuous.configure(text="Captura continua")
+        else:
+            capture_many.configure(text=f"Capturar {target or cantidad_var.get()} muestras")
+            capture_continuous.configure(text="Detener captura")
+
+        countdown = segundos_countdown()
+        if countdown > 0:
+            ejecutar_countdown(countdown)
+        else:
+            comenzar_captura_real()
+
+    def capturar_lote():
+        preparar_captura("batch")
+
+    def capturar_continuo():
+        preparar_captura("continuous")
+
+    # ----------------------------------------------------------
+    # BOTONES
+    # ----------------------------------------------------------
+    buttons = tk.Frame(controls_panel, bg=c["panel"])
+    buttons.pack(fill="x", pady=(0, 4))
+
+    capture_one = tk.Button(
+        buttons,
+        text="Capturar 1 muestra",
+        command=capturar_muestra_unica,
+        relief="flat", bd=0, highlightthickness=1,
+        bg=c["button"], fg=c["text"],
+        activebackground=c["button_active"], activeforeground=c["text"],
+        highlightbackground=c["border"],
+        font=("DejaVu Sans", 9, "bold"),
+        padx=12, pady=9, cursor="hand2",
+    )
+    capture_one.pack(fill="x", pady=(0, 6))
+
+    capture_many = tk.Button(
+        buttons,
+        text="Capturar 30 muestras",
+        command=capturar_lote,
+        relief="flat", bd=0, highlightthickness=1,
+        bg=c["accent"], fg=c["accent_text"],
+        activebackground=c["button_active"], activeforeground=c["text"],
+        highlightbackground=c["border"],
+        font=("DejaVu Sans", 9, "bold"),
+        padx=12, pady=9, cursor="hand2",
+    )
+    capture_many.pack(fill="x", pady=(0, 6))
+
+    capture_continuous = tk.Button(
+        buttons,
+        text="Captura continua",
+        command=capturar_continuo,
+        relief="flat", bd=0, highlightthickness=1,
+        bg=c["button"], fg=c["text"],
+        activebackground=c["button_active"], activeforeground=c["text"],
+        highlightbackground=c["border"],
+        font=("DejaVu Sans", 9, "bold"),
+        padx=12, pady=9, cursor="hand2",
+    )
+    capture_continuous.pack(fill="x")
+
+    def cerrar_entrenamiento():
+        # Si había una serie en curso, guarda lo ya capturado antes de cerrar.
+        if capture_job["running"]:
+            terminar_captura(cancelado=True)
+        capture_job["running"] = False
+        for key in ("after_id", "countdown_after_id"):
+            after_id = capture_job.get(key)
+            if after_id:
+                try:
+                    win.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+        preview_after = preview_state.get("after_id")
+        if preview_after:
+            try:
+                win.after_cancel(preview_after)
+            except tk.TclError:
+                pass
+        globals()["training_window"] = None
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+
+    win.protocol("WM_DELETE_WINDOW", cerrar_entrenamiento)
+    sign_name_var.trace_add("write", lambda *_: actualizar_contador())
+    cantidad_var.trace_add("write", actualizar_texto_lote)
+    actualizar_contador()
+
+    # Si ya hay una cámara seleccionada, la inicia automáticamente para que
+    # la ventana de entrenamiento abra directamente con imagen en vivo.
+    if not running:
+        try:
+            if "camera_combo" in globals() and camera_combo.current() >= 0:
+                iniciar_camara()
+        except Exception:
+            pass
+
+    actualizar_preview()
 
 
 def draw_settings_gear(event=None):
@@ -1932,24 +3562,78 @@ account_button = tk.Canvas(
     cursor="hand2",
 )
 account_button.pack(side="right", padx=(7, 7))
+account_button.bind("<Button-1>", lambda event: toggle_panel_cuenta())
 account_button.bind("<Configure>", draw_account_icon)
 account_button.bind("<Enter>", lambda event: set_header_icon_hover("account"))
 account_button.bind("<Leave>", lambda event: set_header_icon_hover(None))
 
-# Notificaciones: a la izquierda del icono de cuenta.
-notification_button = tk.Canvas(
-    header_controls,
-    width=34,
-    height=34,
-    bd=0,
-    highlightthickness=1,
+# Icono de notificaciones eliminado de la barra superior.
+
+# ---------------- PANEL FLOTANTE DE CUENTA / CONTRIBUCIÓN ----------------
+account_panel = register_theme(
+    tk.Frame(
+        root,
+        highlightthickness=1,
+        bd=0,
+    ),
+    "panel",
+)
+
+account_title = register_theme(
+    tk.Label(
+        account_panel,
+        text="CONTRIBUYE AL PROYECTO",
+        anchor="w",
+        font=("DejaVu Sans", 9, "bold"),
+    ),
+    "text_panel",
+)
+account_title.pack(fill="x", padx=18, pady=(16, 8))
+
+account_message = register_theme(
+    tk.Label(
+        account_panel,
+        text=(
+            "¿Quieres contribuir a la mejora de Manos que Hablan? "
+            "Puedes apoyar el proyecto, proponer mejoras o colaborar desde GitHub."
+        ),
+        anchor="w",
+        justify="left",
+        wraplength=330,
+        font=("DejaVu Sans", 9),
+    ),
+    "muted_panel",
+)
+account_message.pack(fill="x", padx=18, pady=(0, 10))
+
+account_url = tk.Label(
+    account_panel,
+    text=GITHUB_PROJECT_URL,
+    anchor="w",
+    justify="left",
+    wraplength=330,
+    font=("DejaVu Sans", 8, "underline"),
     cursor="hand2",
 )
-notification_button.pack(side="right")
-notification_button.bind("<Configure>", draw_notification_icon)
-notification_button.bind("<Enter>", lambda event: set_header_icon_hover("notification"))
-notification_button.bind("<Leave>", lambda event: set_header_icon_hover(None))
+account_url.pack(fill="x", padx=18, pady=(0, 12))
+account_url.bind("<Button-1>", lambda event: abrir_github_contribucion())
 
+account_open_button = register_theme(
+    tk.Button(
+        account_panel,
+        text="Abrir GitHub",
+        command=abrir_github_contribucion,
+        relief="flat",
+        bd=0,
+        highlightthickness=0,
+        font=("DejaVu Sans", 9, "bold"),
+        padx=12,
+        pady=8,
+        cursor="hand2",
+    ),
+    "primary_button",
+)
+account_open_button.pack(fill="x", padx=18, pady=(0, 16))
 
 # ---------------- PANEL FLOTANTE DE AJUSTES ----------------
 settings_panel = tk.Frame(
@@ -2037,13 +3721,87 @@ for option in ("OFF", "Baja", "Media"):
     btn.bind("<Enter>", _stab_enter)
     btn.bind("<Leave>", _stab_leave)
 
+# ---------------- ENTRENAMIENTO DE MODELO ----------------
+training_separator = tk.Frame(settings_panel, height=1)
+training_separator.pack(fill="x", padx=16, pady=(0, 14))
+
+training_label = tk.Label(
+    settings_panel,
+    text="GESTION DEL MODELO DE RECONOCIMIENTO",
+    anchor="w",
+    font=("DejaVu Sans", 8, "bold"),
+)
+training_label.pack(fill="x", padx=16, pady=(0, 7))
+
+training_actions = tk.Frame(settings_panel)
+training_actions.pack(fill="x", padx=16, pady=(0, 16))
+
+training_button = tk.Button(
+    training_actions,
+    text="Entrenar modelo",
+    command=abrir_ventana_entrenamiento,
+    relief="flat",
+    bd=0,
+    highlightthickness=1,
+    font=("DejaVu Sans", 9, "bold"),
+    padx=8,
+    pady=8,
+    cursor="hand2",
+)
+training_button.pack(side="left", expand=True, fill="x", padx=(0, 5))
+
+load_model_button = tk.Button(
+    training_actions,
+    text="Cargar modelo",
+    command=cargar_modelo_reconocimiento,
+    relief="flat",
+    bd=0,
+    highlightthickness=1,
+    font=("DejaVu Sans", 9, "bold"),
+    padx=8,
+    pady=8,
+    cursor="hand2",
+)
+load_model_button.pack(side="left", expand=True, fill="x", padx=(5, 0))
+
+model_extra_actions = tk.Frame(settings_panel)
+model_extra_actions.pack(fill="x", padx=16, pady=(0, 16))
+
+search_models_button = tk.Button(
+    model_extra_actions,
+    text="Buscar modelos por internet",
+    command=buscar_modelos_internet,
+    relief="flat",
+    bd=0,
+    highlightthickness=1,
+    font=("DejaVu Sans", 9, "bold"),
+    padx=8,
+    pady=8,
+    cursor="hand2",
+)
+search_models_button.pack(side="left", expand=True, fill="x", padx=(0, 5))
+
+delete_models_button = tk.Button(
+    model_extra_actions,
+    text="Eliminar modelos",
+    command=eliminar_modelos_reconocimiento,
+    relief="flat",
+    bd=0,
+    highlightthickness=1,
+    font=("DejaVu Sans", 9, "bold"),
+    padx=8,
+    pady=8,
+    cursor="hand2",
+)
+delete_models_button.pack(side="left", expand=True, fill="x", padx=(5, 0))
+
 # ---------------- ACTUALIZACIONES ----------------
 updates_separator = tk.Frame(settings_panel, height=1)
 updates_separator.pack(fill="x", padx=16, pady=(0, 14))
 
 updates_label = tk.Label(
     settings_panel,
-    text="ACTUALIZACIONES",
+    text="GESTOR DE ACTUALIZACIONES",
     anchor="w",
     font=("DejaVu Sans", 8, "bold"),
 )
@@ -2132,9 +3890,10 @@ main.pack(fill="both", expand=True, padx=8, pady=10)
 # Solo cambia la interfaz; no modifica la lógica de captura ni MediaPipe.
 # Columna izquierda convertida en menú de navegación.
 # Solo cambia la interfaz; la cámara y MediaPipe conservan su lógica.
-main.grid_columnconfigure(0, weight=2, uniform="main_cols")
-main.grid_columnconfigure(1, weight=6, uniform="main_cols")
-main.grid_columnconfigure(2, weight=3, uniform="main_cols")
+SIDEBAR_FIXED_WIDTH = 250
+main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
+main.grid_columnconfigure(1, weight=6, uniform="main_content")
+main.grid_columnconfigure(2, weight=3, uniform="main_content")
 main.grid_rowconfigure(0, weight=1)
 
 # Rectángulo lateral izquierdo
@@ -2197,16 +3956,27 @@ def set_sidebar_active(name):
     sidebar_active = name
     update_sidebar_style()
 
+    # La vista Historial es únicamente visual. Los paneles reales NO se quitan
+    # del grid: solo se coloca una capa vacía encima. Así sus dimensiones
+    # permanecen exactamente iguales y no se achican los cuadros inferiores.
+    if "history_blank_panel" in globals():
+        history_blank_panel.place_forget()
+    if "history_side_blank_panel" in globals():
+        history_side_blank_panel.place_forget()
+    if "history_combined_blank_panel" in globals():
+        history_combined_blank_panel.place_forget()
+
     # Al pulsar "Inicio", ocultamos COMPLETAMENTE el panel del lado derecho
     # y dejamos que la cámara use todo el espacio liberado.
     # No se modifica la lógica de captura ni MediaPipe.
     if name == "Inicio":
+        camera_panel.grid(row=0, column=1, sticky="nsew", padx=6)
         side_panel.grid_remove()
 
         # Quitamos el reparto uniforme mientras el panel derecho está oculto.
         # Así la columna de la cámara puede crecer de verdad.
-        main.grid_columnconfigure(0, weight=2, uniform="")
-        main.grid_columnconfigure(1, weight=8, uniform="")
+        main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
+        main.grid_columnconfigure(1, weight=1, uniform="")
         main.grid_columnconfigure(2, weight=0, minsize=0, uniform="")
 
         # Recalculamos el área real de video después de que Tkinter
@@ -2217,12 +3987,14 @@ def set_sidebar_active(name):
         root.after(120, actualizar_dimensiones_video)
 
     elif name == "Traducir":
+        camera_panel.grid(row=0, column=1, sticky="nsew", padx=6)
+
         # Al volver a Traducir, restauramos el panel derecho y
         # las proporciones normales del dashboard.
         side_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
-        main.grid_columnconfigure(0, weight=2, uniform="main_cols")
-        main.grid_columnconfigure(1, weight=6, uniform="main_cols")
-        main.grid_columnconfigure(2, weight=3, minsize=0, uniform="main_cols")
+        main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
+        main.grid_columnconfigure(1, weight=6, uniform="main_content")
+        main.grid_columnconfigure(2, weight=3, minsize=0, uniform="main_content")
 
         # Volvemos a calcular el tamaño visible de la cámara para que
         # regrese exactamente a su espacio normal.
@@ -2230,6 +4002,35 @@ def set_sidebar_active(name):
         actualizar_dimensiones_video()
         root.after(40, actualizar_dimensiones_video)
         root.after(120, actualizar_dimensiones_video)
+
+    elif name == "Historial":
+        # Conservamos EXACTAMENTE los mismos paneles y el mismo grid que Traducir.
+        # En vez de sustituirlos (lo que hacía recalcular alturas), ponemos una
+        # capa azul vacía encima de cada uno. El layout no cambia ni un píxel.
+        camera_panel.grid(row=0, column=1, sticky="nsew", padx=6)
+        side_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+
+        main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
+        main.grid_columnconfigure(1, weight=6, uniform="main_content")
+        main.grid_columnconfigure(2, weight=3, minsize=0, uniform="main_content")
+
+        # Un único rectángulo vacío cubre cámara + panel derecho.
+        # Se usa place() sobre main para NO tocar el grid ni sus proporciones.
+        root.update_idletasks()
+        x = camera_panel.winfo_x()
+        y = min(camera_panel.winfo_y(), side_panel.winfo_y())
+        right = side_panel.winfo_x() + side_panel.winfo_width()
+        bottom = max(
+            camera_panel.winfo_y() + camera_panel.winfo_height(),
+            side_panel.winfo_y() + side_panel.winfo_height(),
+        )
+        history_combined_blank_panel.place(
+            x=x,
+            y=y,
+            width=max(1, right - x),
+            height=max(1, bottom - y),
+        )
+        history_combined_blank_panel.lift()
 
 def update_sidebar_style():
     if "sidebar_buttons" not in globals():
@@ -2344,6 +4145,14 @@ camera_panel = register_theme(
     "panel",
 )
 camera_panel.grid(row=0, column=1, sticky="nsew", padx=6)
+
+# Capas vacías de Historial. Son HIJAS de los paneles reales y solo los cubren.
+# De esta forma no participan en el grid principal y nunca cambian sus tamaños.
+history_blank_panel = register_theme(
+    tk.Frame(camera_panel, highlightthickness=0),
+    "panel",
+)
+history_blank_panel.place_forget()
 
 camera_header = register_theme(tk.Frame(camera_panel), "panel")
 camera_header.pack(fill="x", padx=14, pady=(12, 8))
@@ -2554,6 +4363,22 @@ side_panel = register_theme(
     "panel",
 )
 side_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+
+# Capa vacía de Historial para el panel derecho.
+# Se crea después de side_panel y no participa en el grid principal.
+history_side_blank_panel = register_theme(
+    tk.Frame(side_panel, highlightthickness=0),
+    "panel",
+)
+history_side_blank_panel.place_forget()
+
+# Capa única de Historial: cubre visualmente cámara + panel derecho como
+# un solo rectángulo, sin modificar el grid ni los tamaños originales.
+history_combined_blank_panel = register_theme(
+    tk.Frame(main, highlightthickness=1),
+    "panel",
+)
+history_combined_blank_panel.place_forget()
 
 # Estado de cámara colocado en el panel derecho.
 # La lógica de set_status() sigue usando exactamente status_label.
@@ -3130,5 +4955,13 @@ actualizar_camaras()
 actualizar_video()
 update_activity_graph()
 monitor_system_theme()
+
+# Carga primero TODOS los JSON entrenados localmente (uno por seña).
+# Después GitHub se combina como fuente externa, sin reemplazar los locales.
+cargar_modelos_locales_entrenados(mostrar_estado=False)
+
+# Carga/actualiza el modelo desde GitHub en segundo plano.
+# No toca process_frames(), por lo que no añade delay a MediaPipe.
+sincronizar_modelo_github()
 
 root.mainloop()
