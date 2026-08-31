@@ -3,13 +3,32 @@ import mediapipe as mp
 import threading
 import os
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import time
+import json
+import urllib.request
+import urllib.error
+import queue
+from pathlib import Path
 
 
 # ==========================================================
 # CONFIGURACIÓN
 # ==========================================================
+
+# Versión instalada de la aplicación.
+# Al publicar una nueva Release, actualiza este valor (por ejemplo 1.0.2).
+APP_VERSION = "1.0.1"
+
+# GitHub Releases se usa como servidor de actualizaciones.
+GITHUB_OWNER = "manosqhablan26-coder"
+GITHUB_REPO = "manos-que-hablan-"
+GITHUB_LATEST_RELEASE_API = (
+    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+)
+
+# Información de la última versión encontrada.
+latest_release_info = None
 
 # Resolución SOLO para el procesamiento de MediaPipe.
 # La cámara visible conserva la resolución que entregue el dispositivo.
@@ -899,6 +918,299 @@ def cerrar_app():
 
 
 # ==========================================================
+# GESTOR DE ACTUALIZACIONES · GITHUB RELEASES
+# ==========================================================
+
+def _version_tuple(version):
+    """Convierte v1.2.3 / 1.2.3 en una tupla comparable de enteros."""
+    version = str(version).strip().lower().lstrip("v")
+    parts = []
+    for piece in version.split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:4])
+
+
+def _set_update_status(text, kind="muted"):
+    """Actualiza el texto del gestor sin bloquear la interfaz."""
+    if "update_status_label" not in globals():
+        return
+
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    color = c["muted"]
+    if kind == "ok":
+        color = c["ok"]
+    elif kind == "error":
+        color = c["danger"]
+    elif kind == "text":
+        color = c["text"]
+
+    update_status_label.configure(text=text, fg=color)
+
+
+def _find_windows_asset(release_data):
+    """Busca primero el ZIP de Windows y, si no, cualquier ZIP de la Release."""
+    assets = release_data.get("assets") or []
+
+    for asset in assets:
+        name = str(asset.get("name", ""))
+        lower = name.lower()
+        if lower.endswith(".zip") and "manosquehablan" in lower and "windows" in lower:
+            return asset
+
+    for asset in assets:
+        name = str(asset.get("name", ""))
+        if name.lower().endswith(".zip"):
+            return asset
+
+    return None
+
+
+def buscar_actualizaciones_app():
+    """Consulta la Release más reciente de GitHub sin bloquear Tkinter."""
+    global latest_release_info
+
+    if "update_check_button" in globals():
+        update_check_button.configure(state="disabled", text="Buscando...")
+    if "update_download_button" in globals():
+        update_download_button.pack_forget()
+
+    _set_update_status("Consultando GitHub Releases...", "muted")
+
+    result_queue = queue.Queue()
+
+    def worker():
+        try:
+            request = urllib.request.Request(
+                GITHUB_LATEST_RELEASE_API,
+                headers={
+                    "User-Agent": "ManosQueHablan-Updater/1.0",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+
+            with urllib.request.urlopen(request, timeout=10) as response:
+                raw = response.read()
+
+            data = json.loads(raw.decode("utf-8"))
+            tag = str(data.get("tag_name", "")).strip()
+
+            if not tag:
+                raise RuntimeError("GitHub no devolvió una versión válida.")
+
+            latest = tag.lstrip("vV")
+            asset = _find_windows_asset(data)
+
+            result_queue.put((
+                "ok",
+                {
+                    "version": latest,
+                    "tag": tag,
+                    "notes": str(data.get("body") or "").strip(),
+                    "page_url": str(data.get("html_url") or "").strip(),
+                    "asset": asset,
+                },
+            ))
+
+        except urllib.error.HTTPError as exc:
+            result_queue.put(("error", f"GitHub respondió con error {exc.code}."))
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            detalle = f" ({reason})" if reason else ""
+            result_queue.put(("error", f"Sin conexión a GitHub{detalle}."))
+        except TimeoutError:
+            result_queue.put(("error", "GitHub tardó demasiado en responder."))
+        except Exception as exc:
+            result_queue.put(("error", f"No se pudo comprobar: {exc}"))
+
+    def revisar_resultado():
+        global latest_release_info
+
+        try:
+            kind, payload = result_queue.get_nowait()
+        except queue.Empty:
+            # Esta función sí corre en el hilo principal de Tkinter.
+            root.after(100, revisar_resultado)
+            return
+
+        if kind == "error":
+            _update_error(payload)
+            return
+
+        latest_release_info = payload
+        latest = payload["version"]
+        tag = payload["tag"]
+        asset = payload["asset"]
+
+        update_check_button.configure(state="normal", text="Buscar actualizaciones")
+
+        if _version_tuple(latest) > _version_tuple(APP_VERSION):
+            _set_update_status(f"Nueva versión disponible: {tag}", "ok")
+
+            if asset:
+                update_download_button.configure(
+                    state="normal",
+                    text=f"Descargar {tag}",
+                    command=descargar_actualizacion_app,
+                )
+            else:
+                update_download_button.configure(
+                    state="normal",
+                    text="Ver Release",
+                    command=abrir_release_actualizacion,
+                )
+
+            update_download_button.pack(fill="x", pady=(7, 0))
+        else:
+            _set_update_status(f"Estás al día · v{APP_VERSION}", "ok")
+
+    threading.Thread(target=worker, daemon=True, name="UpdateCheck").start()
+    root.after(100, revisar_resultado)
+
+
+def _update_error(message):
+    if "update_check_button" in globals():
+        update_check_button.configure(state="normal", text="Reintentar")
+    _set_update_status(message, "error")
+
+
+def abrir_release_actualizacion():
+    """Abre la página de la última Release si no hay ZIP descargable."""
+    import webbrowser
+
+    if latest_release_info and latest_release_info.get("page_url"):
+        webbrowser.open(latest_release_info["page_url"])
+
+
+def _safe_download_path(filename):
+    downloads = Path.home() / "Downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+
+    target = downloads / filename
+    if not target.exists():
+        return target
+
+    stem = target.stem
+    suffix = target.suffix
+    counter = 2
+    while True:
+        candidate = downloads / f"{stem}-{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def descargar_actualizacion_app():
+    """Descarga el ZIP de la nueva versión sin congelar Tkinter."""
+    if not latest_release_info:
+        return
+
+    asset = latest_release_info.get("asset")
+    if not asset:
+        abrir_release_actualizacion()
+        return
+
+    url = str(asset.get("browser_download_url") or "").strip()
+    filename = str(asset.get("name") or "ManosQueHablan-Windows.zip").strip()
+
+    if not url:
+        _set_update_status("La Release no tiene un archivo descargable.", "error")
+        return
+
+    update_download_button.configure(state="disabled", text="Descargando... 0%")
+    _set_update_status("Descargando actualización...", "text")
+
+    def worker():
+        target = _safe_download_path(filename)
+        temp_target = target.with_suffix(target.suffix + ".part")
+
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "ManosQueHablan-Updater"},
+            )
+
+            with urllib.request.urlopen(request, timeout=30) as response, open(temp_target, "wb") as f:
+                total = int(response.headers.get("Content-Length") or 0)
+                downloaded = 0
+
+                while True:
+                    chunk = response.read(1024 * 256)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    if total > 0:
+                        percent = min(100, int(downloaded * 100 / total))
+                        root.after(
+                            0,
+                            lambda p=percent: update_download_button.configure(
+                                text=f"Descargando... {p}%"
+                            ),
+                        )
+
+            temp_target.replace(target)
+
+            def finish():
+                update_download_button.configure(
+                    state="normal",
+                    text="Abrir carpeta de descargas",
+                    command=lambda: abrir_carpeta_descargas(target.parent),
+                )
+                _set_update_status(
+                    f"Descargada: {target.name}",
+                    "ok",
+                )
+                messagebox.showinfo(
+                    "Actualización descargada",
+                    "La nueva versión se descargó correctamente.\n\n"
+                    "Cierra Manos que Hablan antes de reemplazar la versión actual.",
+                )
+
+            root.after(0, finish)
+
+        except Exception as exc:
+            try:
+                if temp_target.exists():
+                    temp_target.unlink()
+            except OSError:
+                pass
+
+            msg = f"Error al descargar: {exc}"
+            root.after(0, lambda: _download_error(msg))
+
+    threading.Thread(target=worker, daemon=True, name="UpdateDownload").start()
+
+
+def _download_error(message):
+    if "update_download_button" in globals():
+        update_download_button.configure(
+            state="normal",
+            text="Reintentar descarga",
+            command=descargar_actualizacion_app,
+        )
+    _set_update_status(message, "error")
+
+
+def abrir_carpeta_descargas(folder):
+    """Abre la carpeta donde quedó el ZIP en Windows, Linux o macOS."""
+    try:
+        folder = str(folder)
+        if os.name == "nt":
+            os.startfile(folder)
+        elif os.sys.platform == "darwin":
+            subprocess.Popen(["open", folder])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+    except Exception as exc:
+        messagebox.showerror("No se pudo abrir la carpeta", str(exc))
+
+
+# ==========================================================
 # INTERFAZ GRÁFICA · ESTILO DASHBOARD
 # ==========================================================
 
@@ -1090,6 +1402,28 @@ def apply_theme(theme_name=None):
         appearance_row.configure(bg=c["panel"])
         stabilization_row.configure(bg=c["panel"])
         settings_separator.configure(bg=c["border"])
+        if "updates_separator" in globals():
+            updates_separator.configure(bg=c["border"])
+        if "updates_label" in globals():
+            updates_label.configure(bg=c["panel"], fg=c["muted"])
+        if "update_version_label" in globals():
+            update_version_label.configure(bg=c["panel"], fg=c["text"])
+        if "update_status_label" in globals():
+            update_status_label.configure(bg=c["panel"])
+        if "updates_actions" in globals():
+            updates_actions.configure(bg=c["panel"])
+        if "update_check_button" in globals():
+            update_check_button.configure(
+                bg=c["button"], fg=c["text"],
+                activebackground=c["button_active"], activeforeground=c["text"],
+                highlightbackground=c["border"],
+            )
+        if "update_download_button" in globals():
+            update_download_button.configure(
+                bg=c["accent"], fg=c["accent_text"],
+                activebackground=c["button_active"], activeforeground=c["text"],
+                highlightbackground=c["border"],
+            )
         update_settings_controls()
 
     if "logo_box" in globals():
@@ -1658,6 +1992,67 @@ for option in ("OFF", "Baja", "Media"):
 
     btn.bind("<Enter>", _stab_enter)
     btn.bind("<Leave>", _stab_leave)
+
+# ---------------- ACTUALIZACIONES ----------------
+updates_separator = tk.Frame(settings_panel, height=1)
+updates_separator.pack(fill="x", padx=16, pady=(0, 14))
+
+updates_label = tk.Label(
+    settings_panel,
+    text="ACTUALIZACIONES",
+    anchor="w",
+    font=("DejaVu Sans", 8, "bold"),
+)
+updates_label.pack(fill="x", padx=16, pady=(0, 7))
+
+update_version_label = tk.Label(
+    settings_panel,
+    text=f"Versión instalada: v{APP_VERSION}",
+    anchor="w",
+    font=("DejaVu Sans", 9, "bold"),
+)
+update_version_label.pack(fill="x", padx=16)
+
+update_status_label = tk.Label(
+    settings_panel,
+    text="Puedes buscar una versión nueva en GitHub.",
+    anchor="w",
+    justify="left",
+    wraplength=290,
+    font=("DejaVu Sans", 8),
+)
+update_status_label.pack(fill="x", padx=16, pady=(4, 8))
+
+updates_actions = tk.Frame(settings_panel)
+updates_actions.pack(fill="x", padx=16, pady=(0, 16))
+
+update_check_button = tk.Button(
+    updates_actions,
+    text="Buscar actualizaciones",
+    command=buscar_actualizaciones_app,
+    relief="flat",
+    bd=0,
+    highlightthickness=1,
+    font=("DejaVu Sans", 9, "bold"),
+    padx=10,
+    pady=7,
+    cursor="hand2",
+)
+update_check_button.pack(fill="x")
+
+update_download_button = tk.Button(
+    updates_actions,
+    text="Descargar actualización",
+    command=descargar_actualizacion_app,
+    relief="flat",
+    bd=0,
+    highlightthickness=1,
+    font=("DejaVu Sans", 9, "bold"),
+    padx=10,
+    pady=7,
+    cursor="hand2",
+)
+# Se muestra solo cuando GitHub informa que existe una versión nueva.
 
 # Estas dos filas deben seguir el color del panel flotante.
 # Se actualizan desde apply_theme().
