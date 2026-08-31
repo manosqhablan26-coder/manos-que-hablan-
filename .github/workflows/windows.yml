@@ -1,0 +1,59 @@
+name: Compilar Manos que Hablan para Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v7
+
+      - name: Instalar Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Actualizar pip
+        run: python -m pip install --upgrade pip setuptools wheel
+
+      - name: Instalar dependencias
+        run: |
+          pip install mediapipe
+          pip install opencv-python
+          pip install numpy
+          pip install pyinstaller
+
+      - name: Mostrar versiones
+        run: |
+          python --version
+          pip show mediapipe
+          pyinstaller --version
+
+      - name: Crear EXE
+        shell: powershell
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name "ManosQueHablan" `
+            --collect-all mediapipe `
+            manos_que_hablan.py
+
+      - name: Crear ZIP
+        shell: powershell
+        run: |
+          Compress-Archive `
+            -Path "dist\ManosQueHablan.exe" `
+            -DestinationPath "ManosQueHablan-Windows.zip"
+
+      - name: Subir EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: ManosQueHablan-Windows
+          path: ManosQueHablan-Windows.zip
+          if-no-files-found: error
