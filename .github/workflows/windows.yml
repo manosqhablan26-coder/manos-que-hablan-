@@ -21,7 +21,7 @@ jobs:
 
       - name: Instalar dependencias
         run: |
-          pip install mediapipe
+          pip install mediapipe==0.10.21
           pip install opencv-python
           pip install numpy
           pip install pyinstaller
