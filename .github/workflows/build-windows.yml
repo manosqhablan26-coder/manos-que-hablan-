@@ -24,9 +24,13 @@ jobs:
           pip install mediapipe==0.10.21
           pip install pillow
 
+      - name: Verificar MediaPipe
+        run: |
+          python -c "import mediapipe as mp; print('MediaPipe:', mp.__version__); print('Tiene solutions:', hasattr(mp, 'solutions'))"
+
       - name: Crear programa Windows
         run: |
-          pyinstaller --noconfirm --clean --windowed --name "ManosQueHablan" manos_que_hablan_fullscreen_inicio_corregido.py
+          pyinstaller --noconfirm --clean --windowed --name "ManosQueHablan" --collect-all mediapipe --hidden-import mediapipe.python.solutions.hands manos_que_hablan_fullscreen_inicio_corregido.py
 
       - name: Subir EXE
         uses: actions/upload-artifact@v4
