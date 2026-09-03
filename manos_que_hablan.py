@@ -13,6 +13,7 @@ import queue
 import hashlib
 import webbrowser
 import base64
+from collections import deque
 from pathlib import Path
 
 
@@ -22,7 +23,7 @@ from pathlib import Path
 
 # Versión instalada de la aplicación.
 # Al publicar una nueva Release, actualiza este valor (por ejemplo 1.0.2).
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 
 # GitHub Releases se usa como servidor de actualizaciones.
 GITHUB_OWNER = "manosqhablan26-coder"
@@ -183,6 +184,57 @@ hands = mp_hands.Hands(
     min_tracking_confidence=0.5
 )
 
+# ==========================================================
+# MEDIAPIPE FACE MESH · OPCIONAL Y SIN INTERFERIR CON MANOS
+# ==========================================================
+# La cara NO se usa para adivinar emociones. Solo extraemos rasgos visibles
+# (apertura de ojos/boca, posición de cejas, labios e inclinación) para que
+# una seña entrenada pueda usar la expresión facial como información adicional.
+try:
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=False,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    FACE_MESH_AVAILABLE = True
+except Exception:
+    mp_face_mesh = None
+    face_mesh = None
+    FACE_MESH_AVAILABLE = False
+
+# Se procesa a baja resolución y en un hilo independiente. Así, si Face Mesh
+# no está disponible o no se necesita, toda la lógica original de manos sigue.
+FACE_PROCESS_WIDTH = 320
+FACE_PROCESS_HEIGHT = 180
+FACE_PROCESS_INTERVAL = 0.090   # ~11 FPS; suficiente para gestos faciales.
+FACE_LIVE_MAX_AGE = 0.35
+FACE_STATIC_WEIGHT = 0.15       # Manos siguen teniendo el mayor peso.
+FACE_DYNAMIC_WEIGHT = 0.12
+FACE_MAX_DISTANCE = 0.40
+
+# Vista ligera de la cara: solo unos pocos puntos/segmentos para no llenar
+# la cámara de marcas ni afectar demasiado el rendimiento.
+SHOW_HAND_POINTS = True
+SHOW_FACE_POINTS = True
+FACE_DISPLAY_INDICES = [
+    33, 133, 159, 145,      # ojo izquierdo
+    362, 263, 386, 374,     # ojo derecho
+    105, 107, 334, 336,     # cejas
+    61, 13, 14, 291,        # boca
+]
+FACE_DISPLAY_CONNECTIONS = [
+    (33, 159), (159, 145), (145, 133),
+    (362, 386), (386, 374), (374, 263),
+    (105, 107), (334, 336),
+    (61, 13), (13, 14), (14, 291),
+]
+FACE_DISPLAY_POINT_RADIUS = 1
+FACE_DISPLAY_POINT_COLOR = (255, 210, 110)
+FACE_DISPLAY_LINE_COLOR = (140, 200, 255)
+
 
 # ==========================================================
 # VARIABLES GLOBALES
@@ -191,6 +243,7 @@ hands = mp_hands.Hands(
 cap = None
 capture_thread = None
 processing_thread = None
+face_thread = None
 
 # Último frame capturado por la cámara.
 latest_frame = None
@@ -240,7 +293,22 @@ loaded_recognition_model_data = None
 recognition_external_samples = []
 recognition_local_samples = []
 recognition_local_files = []
+# Contiene tanto muestras estáticas como secuencias dinámicas ya preparadas.
 recognition_model_samples = []
+
+# Reconocimiento temporal para señas que dependen del movimiento (por ejemplo J/Z
+# o palabras cuyo significado está en la trayectoria). El buffer conserva solo
+# landmarks; nunca guarda imágenes, por lo que el coste de memoria es pequeño.
+DYNAMIC_SEQUENCE_STEPS = 16
+DYNAMIC_BUFFER_MAX_FRAMES = 48
+DYNAMIC_MIN_FRAMES = 8
+DYNAMIC_MIN_MOTION = 0.030
+DYNAMIC_MAX_DISTANCE = 0.62
+DYNAMIC_RECOGNITION_EVERY = 3
+dynamic_recognition_buffer = deque(maxlen=DYNAMIC_BUFFER_MAX_FRAMES)
+dynamic_recognition_tick = 0
+dynamic_last_result = (None, 0.0)
+
 # El reconocimiento de SEÑAS arranca desactivado. MediaPipe puede seguir
 # detectando la mano para la cámara y para Entrenar modelo, pero no se
 # clasifica ninguna seña hasta cargar un modelo o guardar entrenamiento.
@@ -252,6 +320,195 @@ latest_recognition_confidence = 0.0
 # La ventana de entrenamiento reutiliza estos datos para capturar muestras
 # a la misma velocidad del procesamiento, sin crear otro detector por muestra.
 latest_recognition_hands_data = []
+
+# Últimos rasgos faciales. No contienen imagen ni identidad: solo un pequeño
+# vector numérico normalizado. Se actualiza únicamente cuando hace falta.
+latest_face_features = None
+latest_face_frame_id = -1
+latest_face_time = 0.0
+latest_face_overlay_points = []
+latest_face_overlay_frame_id = -1
+face_training_requested = False
+
+
+def _distancia_2d(puntos, a, b):
+    ax, ay, _ = puntos[a]
+    bx, by, _ = puntos[b]
+    return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+
+
+def _extraer_vector_facial(face_landmarks):
+    """Convierte Face Mesh a rasgos geométricos normalizados y observables."""
+    try:
+        puntos = [(float(lm.x), float(lm.y), float(lm.z)) for lm in face_landmarks.landmark]
+    except Exception:
+        return None
+
+    if len(puntos) < 455:
+        return None
+
+    face_width = _distancia_2d(puntos, 234, 454)
+    face_height = _distancia_2d(puntos, 10, 152)
+    left_eye_width = _distancia_2d(puntos, 33, 133)
+    right_eye_width = _distancia_2d(puntos, 362, 263)
+    mouth_width = _distancia_2d(puntos, 61, 291)
+
+    if min(face_width, face_height, left_eye_width, right_eye_width) < 1e-6:
+        return None
+
+    # Aperturas relativas: invariantes a acercarse/alejarse de la cámara.
+    eye_left_open = _distancia_2d(puntos, 159, 145) / left_eye_width
+    eye_right_open = _distancia_2d(puntos, 386, 374) / right_eye_width
+    mouth_open = _distancia_2d(puntos, 13, 14) / face_width
+    outer_mouth_open = _distancia_2d(puntos, 0, 17) / face_width
+    mouth_width_norm = mouth_width / face_width
+
+    # Distancia ceja-ojo para registrar cejas arriba/abajo sin inferir emoción.
+    brow_left = _distancia_2d(puntos, 105, 159) / face_width
+    brow_right = _distancia_2d(puntos, 334, 386) / face_width
+    brow_inner_width = _distancia_2d(puntos, 107, 336) / face_width
+
+    # Curvatura vertical de las comisuras respecto del centro de los labios.
+    mouth_center_y = (puntos[13][1] + puntos[14][1]) * 0.5
+    corner_shape = (
+        (mouth_center_y - puntos[61][1]) +
+        (mouth_center_y - puntos[291][1])
+    ) * 0.5 / face_width
+
+    # Inclinación aproximada de la cabeza usando el eje de los ojos.
+    left_eye_center = (
+        (puntos[33][0] + puntos[133][0]) * 0.5,
+        (puntos[33][1] + puntos[133][1]) * 0.5,
+    )
+    right_eye_center = (
+        (puntos[362][0] + puntos[263][0]) * 0.5,
+        (puntos[362][1] + puntos[263][1]) * 0.5,
+    )
+    dx = right_eye_center[0] - left_eye_center[0]
+    dy = right_eye_center[1] - left_eye_center[1]
+    # Evitamos importar math: esta razón acotada es suficiente como rasgo.
+    head_tilt = max(-1.0, min(1.0, dy / max(abs(dx), 1e-6)))
+
+    vector = [
+        eye_left_open, eye_right_open,
+        brow_left, brow_right, brow_inner_width,
+        mouth_open, outer_mouth_open, mouth_width_norm, corner_shape,
+        head_tilt,
+    ]
+
+    # Protección contra valores absurdos por detecciones parciales.
+    if any((value != value) or abs(value) > 10.0 for value in vector):
+        return None
+
+    return {
+        "version": 1,
+        "vector": [float(value) for value in vector],
+    }
+
+
+def _vector_facial_desde_dato(face_data):
+    if not isinstance(face_data, dict):
+        return None
+    vector = face_data.get("vector")
+    if not isinstance(vector, list) or not vector:
+        return None
+    try:
+        result = [float(value) for value in vector]
+    except (TypeError, ValueError):
+        return None
+    if any((value != value) or abs(value) > 10.0 for value in result):
+        return None
+    return result
+
+
+def _distancia_vectorial(vector_a, vector_b):
+    if not vector_a or not vector_b or len(vector_a) != len(vector_b):
+        return None
+    squared = sum((a - b) * (a - b) for a, b in zip(vector_a, vector_b))
+    return (squared / len(vector_a)) ** 0.5
+
+
+def _modelos_usan_cara():
+    for sample in recognition_model_samples:
+        if not isinstance(sample, dict):
+            continue
+        if sample.get("face_vector") or sample.get("face_sequence"):
+            return True
+    return False
+
+
+def _cara_actual_reciente():
+    with lock:
+        face = latest_face_features
+        face_time = latest_face_time
+    if face is None or face_time <= 0:
+        return None
+    if time.perf_counter() - face_time > FACE_LIVE_MAX_AGE:
+        return None
+    return {
+        "version": int(face.get("version", 1)),
+        "vector": list(face.get("vector", [])),
+    }
+
+
+def _extraer_puntos_overlay_facial(face_landmarks):
+    """Extrae solo unos pocos puntos visibles para mostrar la cara sin saturar la cámara."""
+    overlay = []
+    try:
+        total = len(face_landmarks.landmark)
+        for idx in FACE_DISPLAY_INDICES:
+            if 0 <= idx < total:
+                lm = face_landmarks.landmark[idx]
+                overlay.append((int(idx), float(lm.x), float(lm.y)))
+    except Exception:
+        return []
+    return overlay
+
+
+def _dibujar_puntos_faciales(frame):
+    if not SHOW_FACE_POINTS:
+        return
+
+    with lock:
+        overlay = list(latest_face_overlay_points or [])
+        face_time = latest_face_time
+
+    if not overlay or face_time <= 0:
+        return
+    if time.perf_counter() - face_time > FACE_LIVE_MAX_AGE:
+        return
+
+    alto, ancho = frame.shape[:2]
+    point_map = {}
+    for idx, x, y in overlay:
+        px = int(round(x * ancho))
+        py = int(round(y * alto))
+        if 0 <= px < ancho and 0 <= py < alto:
+            point_map[int(idx)] = (px, py)
+
+    if not point_map:
+        return
+
+    for a, b in FACE_DISPLAY_CONNECTIONS:
+        if a in point_map and b in point_map:
+            cv2.line(
+                frame,
+                point_map[a],
+                point_map[b],
+                FACE_DISPLAY_LINE_COLOR,
+                1,
+                lineType=cv2.LINE_AA,
+            )
+
+    for px, py in point_map.values():
+        cv2.circle(
+            frame,
+            (px, py),
+            FACE_DISPLAY_POINT_RADIUS,
+            FACE_DISPLAY_POINT_COLOR,
+            -1,
+            lineType=cv2.LINE_AA,
+        )
 
 
 def _vector_reconocimiento(hands_data):
@@ -308,8 +565,143 @@ def _vector_reconocimiento(hands_data):
     }
 
 
+def _ordenar_manos_movimiento(hands_data):
+    """Devuelve manos ordenadas de forma estable con sus 21 puntos numéricos."""
+    prepared = []
+    for index, hand in enumerate(hands_data or []):
+        if not isinstance(hand, dict):
+            continue
+        landmarks = hand.get("landmarks")
+        if not isinstance(landmarks, list) or len(landmarks) != 21:
+            continue
+        try:
+            points = [
+                (float(lm["x"]), float(lm["y"]), float(lm["z"]))
+                if isinstance(lm, dict)
+                else (float(lm.x), float(lm.y), float(lm.z))
+                for lm in landmarks
+            ]
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+
+        handedness = str(hand.get("handedness", "Unknown"))
+        order = 0 if handedness == "Left" else 1 if handedness == "Right" else 2
+        prepared.append(((order, points[0][0], index), handedness, points))
+
+    prepared.sort(key=lambda item: item[0])
+    return [(handedness, points) for _, handedness, points in prepared[:2]]
+
+
+def _energia_movimiento(sequence):
+    """Movimiento medio entre frames de una secuencia ya normalizada."""
+    if not sequence or len(sequence) < 2:
+        return 0.0
+    total = 0.0
+    pares = 0
+    for anterior, actual in zip(sequence, sequence[1:]):
+        if len(anterior) != len(actual) or not actual:
+            continue
+        squared = sum((a - b) * (a - b) for a, b in zip(actual, anterior))
+        total += (squared / len(actual)) ** 0.5
+        pares += 1
+    return total / max(1, pares)
+
+
+def _vectorizar_secuencia_movimiento(frames, target_steps=DYNAMIC_SEQUENCE_STEPS):
+    """
+    Convierte una secuencia de landmarks a un número fijo de pasos.
+
+    A diferencia del reconocedor estático, el origen queda fijado en la muñeca
+    del PRIMER frame. Así se conserva la trayectoria de la mano en el tiempo,
+    pero se elimina la posición inicial y se normaliza el tamaño de la mano.
+    """
+    raw_frames = []
+    for frame in frames or []:
+        hands_data = frame.get("hands", []) if isinstance(frame, dict) else frame
+        ordered = _ordenar_manos_movimiento(hands_data)
+        if ordered:
+            raw_frames.append(ordered)
+
+    if len(raw_frames) < 2:
+        return None
+
+    # Tomamos el número de manos del primer frame y descartamos pérdidas breves.
+    hand_count = len(raw_frames[0])
+    raw_frames = [frame for frame in raw_frames if len(frame) == hand_count]
+    if len(raw_frames) < 2:
+        return None
+
+    bases = []
+    for _, points in raw_frames[0]:
+        wx, wy, wz = points[0]
+        scale = max(
+            (((x - wx) ** 2 + (y - wy) ** 2 + (z - wz) ** 2) ** 0.5 for x, y, z in points),
+            default=0.0,
+        )
+        if scale < 1e-6:
+            return None
+        bases.append(((wx, wy, wz), scale))
+
+    sequence = []
+    for frame in raw_frames:
+        vector = []
+        for hand_index, (_, points) in enumerate(frame):
+            (bx, by, bz), scale = bases[hand_index]
+            for x, y, z in points:
+                vector.extend(((x - bx) / scale, (y - by) / scale, (z - bz) / scale))
+        sequence.append(vector)
+
+    if not sequence:
+        return None
+
+    # Remuestreo temporal: todas las ejecuciones terminan con el mismo número
+    # de pasos aunque el usuario haga la seña algo más rápido o más lento.
+    if target_steps and len(sequence) != target_steps:
+        if target_steps <= 1:
+            sequence = [sequence[-1]]
+        else:
+            last = len(sequence) - 1
+            indices = [round(i * last / (target_steps - 1)) for i in range(target_steps)]
+            sequence = [sequence[index] for index in indices]
+
+    return {
+        "hand_count": hand_count,
+        "sequence": sequence,
+        "motion": _energia_movimiento(sequence),
+    }
+
+
+def _vectorizar_secuencia_facial(frames, target_steps=DYNAMIC_SEQUENCE_STEPS):
+    """Extrae y remuestrea la secuencia facial presente en un clip dinámico."""
+    sequence = []
+    for frame in frames or []:
+        if not isinstance(frame, dict):
+            continue
+        vector = _vector_facial_desde_dato(frame.get("face"))
+        if vector is not None:
+            sequence.append(vector)
+
+    if len(sequence) < 2:
+        return None
+
+    dims = len(sequence[0])
+    sequence = [item for item in sequence if len(item) == dims]
+    if len(sequence) < 2:
+        return None
+
+    if target_steps and len(sequence) != target_steps:
+        if target_steps <= 1:
+            sequence = [sequence[-1]]
+        else:
+            last = len(sequence) - 1
+            indices = [round(i * last / (target_steps - 1)) for i in range(target_steps)]
+            sequence = [sequence[index] for index in indices]
+
+    return sequence
+
+
 def _preparar_muestras_reconocimiento(data):
-    """Valida el JSON de entrenamiento y precalcula los vectores de cada muestra."""
+    """Valida JSON antiguos y añade cara solo cuando esa muestra la contiene."""
     if not isinstance(data, dict) or not isinstance(data.get("samples"), list):
         return []
 
@@ -319,18 +711,147 @@ def _preparar_muestras_reconocimiento(data):
             continue
 
         label = str(sample.get("label", "")).strip().upper()
-        feature = _vector_reconocimiento(sample.get("hands", []))
-        if not label or feature is None:
+        if not label:
             continue
 
-        prepared.append({
+        # Formato nuevo para una seña dinámica.
+        if str(sample.get("type", "")).lower() == "dynamic" or isinstance(sample.get("frames"), list):
+            feature = _vectorizar_secuencia_movimiento(sample.get("frames", []))
+            if feature is None:
+                continue
+            item = {
+                "label": label,
+                "kind": "dynamic",
+                "hand_count": feature["hand_count"],
+                "sequence": feature["sequence"],
+                "motion": feature["motion"],
+            }
+            face_sequence = _vectorizar_secuencia_facial(sample.get("frames", []))
+            if face_sequence is not None:
+                item["face_sequence"] = face_sequence
+            prepared.append(item)
+            continue
+
+        # Formato original: una pose de un único frame.
+        feature = _vector_reconocimiento(sample.get("hands", []))
+        if feature is None:
+            continue
+        item = {
             "label": label,
+            "kind": "static",
             "hand_count": feature["hand_count"],
             "vector": feature["vector"],
-        })
+        }
+        face_vector = _vector_facial_desde_dato(sample.get("face"))
+        if face_vector is not None:
+            item["face_vector"] = face_vector
+        prepared.append(item)
 
     return prepared
 
+
+def reconocer_sena_dinamica(frames):
+    """Reconoce trayectorias comparando ventanas recientes con secuencias entrenadas."""
+    dynamic_samples = [
+        sample for sample in recognition_model_samples
+        if isinstance(sample, dict) and sample.get("kind") == "dynamic"
+    ]
+    if not dynamic_samples or not frames:
+        return None, 0.0
+
+    # Probamos varias longitudes recientes para tolerar distintas velocidades.
+    total_frames = len(frames)
+    candidate_lengths = []
+    for length in (12, 18, 24, 32, total_frames):
+        length = min(total_frames, length)
+        if length >= DYNAMIC_MIN_FRAMES and length not in candidate_lengths:
+            candidate_lengths.append(length)
+
+    best_by_label = {}
+    for length in candidate_lengths:
+        feature = _vectorizar_secuencia_movimiento(list(frames)[-length:])
+        if feature is None or feature["motion"] < DYNAMIC_MIN_MOTION:
+            continue
+
+        current_sequence = feature["sequence"]
+        current_motion = feature["motion"]
+        current_face_sequence = _vectorizar_secuencia_facial(list(frames)[-length:])
+
+        for sample in dynamic_samples:
+            if sample.get("hand_count") != feature["hand_count"]:
+                continue
+            reference_sequence = sample.get("sequence") or []
+            if len(reference_sequence) != len(current_sequence):
+                continue
+
+            squared = 0.0
+            dims = 0
+            for current_frame, reference_frame in zip(current_sequence, reference_sequence):
+                if len(current_frame) != len(reference_frame):
+                    squared = None
+                    break
+                for a, b in zip(current_frame, reference_frame):
+                    diff = a - b
+                    squared += diff * diff
+                    dims += 1
+            if squared is None or dims == 0:
+                continue
+
+            distance = (squared / dims) ** 0.5
+
+            # Penaliza secuencias con una cantidad de movimiento muy diferente.
+            reference_motion = max(1e-6, float(sample.get("motion", 0.0)))
+            motion_ratio = min(current_motion, reference_motion) / max(current_motion, reference_motion)
+            adjusted_distance = distance + (1.0 - motion_ratio) * 0.12
+
+            # La cara es complementaria: solo participa si ESA muestra fue
+            # entrenada con rostro y el rostro actual está disponible.
+            reference_face_sequence = sample.get("face_sequence")
+            if current_face_sequence and reference_face_sequence:
+                if len(current_face_sequence) == len(reference_face_sequence):
+                    face_squared = 0.0
+                    face_dims = 0
+                    face_valid = True
+                    for current_face, reference_face in zip(
+                        current_face_sequence, reference_face_sequence
+                    ):
+                        if len(current_face) != len(reference_face):
+                            face_valid = False
+                            break
+                        for a, b in zip(current_face, reference_face):
+                            diff = a - b
+                            face_squared += diff * diff
+                            face_dims += 1
+                    if face_valid and face_dims:
+                        face_distance = (face_squared / face_dims) ** 0.5
+                        face_normalized = min(1.5, face_distance / FACE_MAX_DISTANCE)
+                        hand_normalized = min(1.5, adjusted_distance / DYNAMIC_MAX_DISTANCE)
+                        combined = (
+                            hand_normalized * (1.0 - FACE_DYNAMIC_WEIGHT)
+                            + face_normalized * FACE_DYNAMIC_WEIGHT
+                        )
+                        adjusted_distance = combined * DYNAMIC_MAX_DISTANCE
+
+            label = sample["label"]
+            previous = best_by_label.get(label)
+            if previous is None or adjusted_distance < previous:
+                best_by_label[label] = adjusted_distance
+
+    if not best_by_label:
+        return None, 0.0
+
+    ordered = sorted((distance, label) for label, distance in best_by_label.items())
+    nearest_distance, winner = ordered[0]
+    second_distance = ordered[1][0] if len(ordered) > 1 else DYNAMIC_MAX_DISTANCE
+
+    similarity = max(0.0, min(1.0, 1.0 - nearest_distance / DYNAMIC_MAX_DISTANCE))
+    separation = max(0.0, min(1.0, (second_distance - nearest_distance) / max(0.10, second_distance)))
+    confidence = (similarity * 0.82 + separation * 0.18) * 100.0
+
+    if nearest_distance > DYNAMIC_MAX_DISTANCE or confidence < 58.0:
+        return None, confidence
+
+    return winner, min(99.0, confidence)
 
 def _sanitizar_nombre_modelo(nombre):
     """Convierte el nombre visible de una seña en un nombre de archivo seguro."""
@@ -584,8 +1105,8 @@ def sincronizar_modelo_github():
     ).start()
 
 
-def reconocer_sena(hands_data):
-    """Reconoce una seña por vecinos cercanos usando las muestras JSON cargadas."""
+def reconocer_sena(hands_data, face_data=None):
+    """Reconoce manos y usa la cara solo en modelos entrenados con ella."""
     model_samples = recognition_model_samples
     if not model_samples:
         return None, 0.0
@@ -596,9 +1117,12 @@ def reconocer_sena(hands_data):
 
     current = feature["vector"]
     hand_count = feature["hand_count"]
+    current_face_vector = _vector_facial_desde_dato(face_data)
     distances = []
 
     for sample in model_samples:
+        if sample.get("kind", "static") != "static":
+            continue
         if sample["hand_count"] != hand_count:
             continue
 
@@ -611,7 +1135,23 @@ def reconocer_sena(hands_data):
         for a, b in zip(current, reference):
             diff = a - b
             squared += diff * diff
-        distance = (squared / max(1, len(current))) ** 0.5
+        hand_distance = (squared / max(1, len(current))) ** 0.5
+        distance = hand_distance
+
+        reference_face_vector = sample.get("face_vector")
+        if current_face_vector is not None and reference_face_vector is not None:
+            face_distance = _distancia_vectorial(current_face_vector, reference_face_vector)
+            if face_distance is not None:
+                # Normalizamos las dos distancias antes de mezclarlas para que
+                # la cara ayude, pero nunca domine a las manos.
+                hand_normalized = min(1.5, hand_distance / 0.42)
+                face_normalized = min(1.5, face_distance / FACE_MAX_DISTANCE)
+                combined = (
+                    hand_normalized * (1.0 - FACE_STATIC_WEIGHT)
+                    + face_normalized * FACE_STATIC_WEIGHT
+                )
+                distance = combined * 0.42
+
         distances.append((distance, sample["label"]))
 
     if not distances:
@@ -837,6 +1377,87 @@ def stabilize_hand_landmarks(hand_landmarks, hand_key):
 
 
 # ==========================================================
+# PROCESAMIENTO FACIAL EN HILO INDEPENDIENTE
+# ==========================================================
+
+def process_face_frames():
+    global latest_face_features
+    global latest_face_frame_id
+    global latest_face_time
+    global latest_face_overlay_points
+    global latest_face_overlay_frame_id
+
+    if not FACE_MESH_AVAILABLE or face_mesh is None:
+        return
+
+    processed_id = -1
+    last_run = 0.0
+
+    while running:
+        # Si ningún modelo necesita cara, el usuario no la está entrenando y
+        # tampoco se pidió mostrar puntos, este hilo queda casi dormido.
+        if (not SHOW_FACE_POINTS) and (not face_training_requested) and (not _modelos_usan_cara()):
+            with lock:
+                latest_face_features = None
+                latest_face_frame_id = -1
+                latest_face_time = 0.0
+                latest_face_overlay_points = []
+                latest_face_overlay_frame_id = -1
+            time.sleep(0.05)
+            continue
+
+        now = time.perf_counter()
+        remaining = FACE_PROCESS_INTERVAL - (now - last_run)
+        if remaining > 0:
+            time.sleep(min(remaining, 0.02))
+            continue
+
+        with lock:
+            if latest_frame is None or latest_frame_id == processed_id:
+                source = None
+            else:
+                source = latest_frame.copy()
+                source_id = latest_frame_id
+
+        if source is None:
+            time.sleep(0.003)
+            continue
+
+        # Igual que manos: espejo primero para trabajar con la misma orientación.
+        source = cv2.flip(source, 1)
+        small = cv2.resize(
+            source,
+            (FACE_PROCESS_WIDTH, FACE_PROCESS_HEIGHT),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+
+        try:
+            result = face_mesh.process(rgb)
+        except Exception:
+            result = None
+
+        features = None
+        overlay_points = []
+        if result is not None and result.multi_face_landmarks:
+            face_landmarks = result.multi_face_landmarks[0]
+            features = _extraer_vector_facial(face_landmarks)
+            overlay_points = _extraer_puntos_overlay_facial(face_landmarks)
+
+        stamp = time.perf_counter()
+        with lock:
+            latest_face_features = features
+            latest_face_frame_id = source_id
+            latest_face_overlay_points = overlay_points
+            latest_face_overlay_frame_id = source_id if overlay_points else -1
+            latest_face_time = stamp if (features is not None or overlay_points) else 0.0
+
+        processed_id = source_id
+        last_run = stamp
+
+
+# ==========================================================
 # PROCESAMIENTO MEDIAPIPE EN HILO INDEPENDIENTE
 # ==========================================================
 
@@ -851,6 +1472,8 @@ def process_frames():
     global latest_recognized_sign
     global latest_recognition_confidence
     global latest_recognition_hands_data
+    global dynamic_recognition_tick
+    global dynamic_last_result
 
     processed_id = -1
 
@@ -937,20 +1560,23 @@ def process_frames():
                     ],
                 })
 
-                mp_drawing.draw_landmarks(
-                    frame,
-                    hand_landmarks,
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_drawing.DrawingSpec(
-                        color=(0, 220, 255),
-                        thickness=2,
-                        circle_radius=2
-                    ),
-                    mp_drawing.DrawingSpec(
-                        color=(80, 255, 140),
-                        thickness=2
+                # Esta opción solo oculta/muestra los puntos; los landmarks
+                # siguen entrando al reconocimiento aunque no se dibujen.
+                if SHOW_HAND_POINTS:
+                    mp_drawing.draw_landmarks(
+                        frame,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing.DrawingSpec(
+                            color=(0, 220, 255),
+                            thickness=2,
+                            circle_radius=2
+                        ),
+                        mp_drawing.DrawingSpec(
+                            color=(80, 255, 140),
+                            thickness=2
+                        )
                     )
-                )
 
             stale_keys = [
                 key for key in list(landmark_history.keys())
@@ -963,8 +1589,47 @@ def process_frames():
         else:
             landmark_history.clear()
 
+        # Dibujamos solo unos pocos puntos de la cara para mantener la cámara limpia.
+        _dibujar_puntos_faciales(frame)
+
+        # ------------------------------------------------------
+        # RECONOCIMIENTO HÍBRIDO: manos + movimiento + cara opcional
+        # ------------------------------------------------------
+        face_snapshot = _cara_actual_reciente()
+
+        if recognition_hands_data:
+            dynamic_frame = {
+                "t": time.perf_counter(),
+                "hands": recognition_hands_data,
+            }
+            if face_snapshot is not None:
+                dynamic_frame["face"] = face_snapshot
+            dynamic_recognition_buffer.append(dynamic_frame)
+        else:
+            dynamic_recognition_buffer.clear()
+            dynamic_last_result = (None, 0.0)
+
         if recognition_enabled and recognition_hands_data and recognition_model_samples:
-            recognized_sign, recognition_confidence = reconocer_sena(recognition_hands_data)
+            static_sign, static_confidence = reconocer_sena(
+                recognition_hands_data,
+                face_snapshot,
+            )
+
+            dynamic_recognition_tick += 1
+            if dynamic_recognition_tick >= DYNAMIC_RECOGNITION_EVERY:
+                dynamic_recognition_tick = 0
+                dynamic_last_result = reconocer_sena_dinamica(dynamic_recognition_buffer)
+
+            dynamic_sign, dynamic_confidence = dynamic_last_result
+
+            # Cuando una trayectoria dinámica encaja con suficiente seguridad,
+            # tiene prioridad sobre una pose intermedia que podría parecer estática.
+            if dynamic_sign and dynamic_confidence >= max(62.0, static_confidence - 4.0):
+                recognized_sign = dynamic_sign
+                recognition_confidence = dynamic_confidence
+            else:
+                recognized_sign = static_sign
+                recognition_confidence = static_confidence
         else:
             recognized_sign, recognition_confidence = None, 0.0
 
@@ -1018,6 +1683,7 @@ def iniciar_camara():
     global cap
     global capture_thread
     global processing_thread
+    global face_thread
     global running
     global latest_frame
     global latest_frame_id
@@ -1072,12 +1738,16 @@ def iniciar_camara():
         latest_frame_capture_time = 0.0
         latest_processed_frame = None
         latest_processed_frame_id = -1
+        globals()["latest_face_features"] = None
+        globals()["latest_face_frame_id"] = -1
+        globals()["latest_face_time"] = 0.0
 
     camera_fps = 0.0
     mediapipe_fps = 0.0
     display_fps = 0.0
 
     landmark_history.clear()
+    dynamic_recognition_buffer.clear()
 
     last_capture_time = 0.0
     last_process_time = 0.0
@@ -1097,8 +1767,18 @@ def iniciar_camara():
         name="MediaPipeProcessing"
     )
 
+    face_thread = None
+    if FACE_MESH_AVAILABLE:
+        face_thread = threading.Thread(
+            target=process_face_frames,
+            daemon=True,
+            name="MediaPipeFaceProcessing",
+        )
+
     capture_thread.start()
     processing_thread.start()
+    if face_thread is not None:
+        face_thread.start()
 
     # Iniciar permanece visible incluso con la cámara encendida.
     start_button.configure(text="▶ Iniciar")
@@ -1122,8 +1802,14 @@ def detener_camara():
     global running
     global capture_thread
     global processing_thread
+    global face_thread
     global latest_frame
     global latest_processed_frame
+    global latest_face_features
+    global latest_face_frame_id
+    global latest_face_time
+    global latest_face_overlay_points
+    global latest_face_overlay_frame_id
 
     running = False
 
@@ -1137,12 +1823,23 @@ def detener_camara():
 
     processing_thread = None
 
+    if face_thread is not None and face_thread.is_alive():
+        face_thread.join(timeout=0.5)
+    face_thread = None
+
     if cap is not None:
         cap.release()
         cap = None
 
     with lock:
         latest_frame = None
+        latest_face_features = None
+        latest_face_frame_id = -1
+        latest_face_time = 0.0
+        latest_face_overlay_points = []
+        latest_face_overlay_frame_id = -1
+
+    dynamic_recognition_buffer.clear()
 
     if "stop_button" in globals():
         stop_button.configure(state="disabled")
@@ -1566,6 +2263,11 @@ def actualizar_dimensiones_video():
 def cerrar_app():
     detener_camara()
     hands.close()
+    if face_mesh is not None:
+        try:
+            face_mesh.close()
+        except Exception:
+            pass
     root.destroy()
 
 
@@ -2079,6 +2781,26 @@ def apply_theme(theme_name=None):
         appearance_row.configure(bg=c["panel"])
         stabilization_row.configure(bg=c["panel"])
         settings_separator.configure(bg=c["border"])
+        if "landmarks_separator" in globals():
+            landmarks_separator.configure(bg=c["border"])
+        if "landmarks_label" in globals():
+            landmarks_label.configure(bg=c["panel"], fg=c["muted"])
+        if "landmarks_options" in globals():
+            landmarks_options.configure(bg=c["panel"])
+        if "show_hand_points_check" in globals():
+            show_hand_points_check.configure(
+                bg=c["panel"], fg=c["text"],
+                activebackground=c["panel"], activeforeground=c["text"],
+                selectcolor=c["button"],
+            )
+        if "show_face_points_check" in globals():
+            show_face_points_check.configure(
+                bg=c["panel"], fg=c["text"],
+                activebackground=c["panel"], activeforeground=c["text"],
+                selectcolor=c["button"],
+            )
+        if "landmarks_help" in globals():
+            landmarks_help.configure(bg=c["panel"], fg=c["muted"])
         if "training_separator" in globals():
             training_separator.configure(bg=c["border"])
         if "training_label" in globals():
@@ -2407,6 +3129,8 @@ header_controls.pack(side="right", padx=14, pady=5)
 
 theme_var = tk.StringVar(value="Sistema")
 stabilization_var = tk.StringVar(value="Baja")
+show_hand_points_var = tk.BooleanVar(value=SHOW_HAND_POINTS)
+show_face_points_var = tk.BooleanVar(value=SHOW_FACE_POINTS)
 settings_panel_visible = False
 account_panel_visible = False
 settings_theme_buttons = {}
@@ -2455,6 +3179,21 @@ def seleccionar_estabilizacion(value):
     stabilization_var.set(value)
     set_stabilization_mode()
     update_settings_controls()
+
+
+def actualizar_visibilidad_landmarks():
+    """Cambia solo la visualización; reconocimiento y entrenamiento siguen activos."""
+    global SHOW_HAND_POINTS, SHOW_FACE_POINTS
+
+    try:
+        SHOW_HAND_POINTS = bool(show_hand_points_var.get())
+    except Exception:
+        SHOW_HAND_POINTS = True
+
+    try:
+        SHOW_FACE_POINTS = bool(show_face_points_var.get())
+    except Exception:
+        SHOW_FACE_POINTS = True
 
 
 def cerrar_panel_ajustes():
@@ -3347,6 +4086,51 @@ def abrir_ventana_entrenamiento():
         (6, 0),
     )
 
+    include_face_var = tk.BooleanVar(value=False)
+
+    face_option_box = tk.Frame(options_row, bg=c["panel_alt"])
+    face_option_box.pack(fill="x", pady=(8, 0))
+    face_check = tk.Checkbutton(
+        face_option_box,
+        text="Incluir gestos faciales",
+        variable=include_face_var,
+        bg=c["panel_alt"],
+        fg=c["text"],
+        activebackground=c["panel_alt"],
+        activeforeground=c["text"],
+        selectcolor=c["button"],
+        font=("DejaVu Sans", 9, "bold"),
+        anchor="w",
+        cursor="hand2",
+    )
+    face_check.pack(fill="x")
+    face_help = tk.Label(
+        face_option_box,
+        text=(
+            "Guarda cejas, ojos, boca e inclinación como parte de la seña. "
+            "No intenta adivinar emociones."
+        ),
+        bg=c["panel_alt"],
+        fg=c["muted"],
+        font=("DejaVu Sans", 8),
+        anchor="w",
+        justify="left",
+        wraplength=330,
+    )
+    face_help.pack(fill="x", pady=(2, 0))
+
+    if not FACE_MESH_AVAILABLE:
+        face_check.configure(state="disabled")
+        face_help.configure(
+            text="Face Mesh no está disponible; el reconocimiento de manos continúa normalmente."
+        )
+
+    def actualizar_solicitud_cara(*_):
+        global face_training_requested
+        face_training_requested = bool(include_face_var.get()) and FACE_MESH_AVAILABLE
+
+    include_face_var.trace_add("write", actualizar_solicitud_cara)
+
     status_var = tk.StringVar(
         value="Escribe el nombre de la seña, elige las opciones y mantén la mano visible."
     )
@@ -3474,8 +4258,8 @@ def abrir_ventana_entrenamiento():
             if str(hand.get("handedness", "")).strip().lower() == objetivo
         ]
 
-    def obtener_muestra_actual(nombre, filtro="Todas"):
-        """Toma la muestra del último frame YA procesado por MediaPipe."""
+    def obtener_muestra_actual(nombre, filtro="Todas", incluir_cara=False):
+        """Toma manos del último frame y, opcionalmente, el rostro más reciente."""
         with lock:
             frame_id = latest_processed_frame_id
             hands_snapshot = copiar_manos(latest_recognition_hands_data)
@@ -3485,11 +4269,18 @@ def abrir_ventana_entrenamiento():
         if frame_id < 0 or not hands_snapshot:
             return None, frame_id
 
-        return {
+        sample = {
             "label": nombre,
             "timestamp": time.time(),
             "hands": hands_snapshot,
-        }, frame_id
+        }
+
+        if incluir_cara:
+            face_snapshot = _cara_actual_reciente()
+            if face_snapshot is not None:
+                sample["face"] = face_snapshot
+
+        return sample, frame_id
 
     # ----------------------------------------------------------
     # PREVIEW RÁPIDO: solo redibuja cuando existe un frame nuevo.
@@ -3539,8 +4330,11 @@ def abrir_ventana_entrenamiento():
             if photo is not None:
                 preview_label.configure(image=photo, text="")
                 preview_label.image = photo
+            face_text = ""
+            if include_face_var.get():
+                face_text = "  •  rostro ✓" if _cara_actual_reciente() is not None else "  •  rostro --"
             preview_info_var.set(
-                f"CÁMARA EN VIVO  •  {hand_count} mano(s)  •  {mediapipe_fps:.0f} FPS"
+                f"CÁMARA EN VIVO  •  {hand_count} mano(s){face_text}  •  {mediapipe_fps:.0f} FPS"
             )
         elif not running:
             preview_label.configure(image="", text="La cámara está detenida")
@@ -3562,9 +4356,13 @@ def abrir_ventana_entrenamiento():
         "min_interval": 0.0,
         "label": "",
         "hand_filter": "Todas",
+        "include_face": False,
         "data": None,
         "after_id": None,
         "countdown_after_id": None,
+        "motion_frames": [],
+        "motion_started_at": 0.0,
+        "motion_duration": 1.20,
     }
 
     def intervalo_seleccionado():
@@ -3603,7 +4401,8 @@ def abrir_ventana_entrenamiento():
             return False
 
         filtro = hand_filter_var.get()
-        sample, frame_id = obtener_muestra_actual(nombre, filtro)
+        incluir_cara = bool(include_face_var.get())
+        sample, frame_id = obtener_muestra_actual(nombre, filtro, incluir_cara=incluir_cara)
         if sample is None:
             if not running:
                 status_var.set("La cámara está detenida. Iníciala para registrar la seña.")
@@ -3611,6 +4410,12 @@ def abrir_ventana_entrenamiento():
                 status_var.set(
                     f"No detecté la mano seleccionada ({filtro.lower()}) en el último frame."
                 )
+            return False
+
+        if incluir_cara and "face" not in sample:
+            status_var.set(
+                "No detecté el rostro con claridad. Mira hacia la cámara y vuelve a capturar."
+            )
             return False
 
         try:
@@ -3630,6 +4435,10 @@ def abrir_ventana_entrenamiento():
             capture_many.configure(text=f"Capturar {int(cantidad_var.get())} muestras")
             capture_continuous.configure(text="Captura continua")
             capture_one.configure(state="normal")
+            try:
+                capture_motion.configure(text="🎥 Capturar seña con movimiento", state="normal")
+            except (NameError, tk.TclError):
+                pass
         except tk.TclError:
             pass
 
@@ -3664,6 +4473,12 @@ def abrir_ventana_entrenamiento():
         restaurar_botones()
         if cancelado:
             status_var.set(f"Captura detenida. Se guardaron {captured} muestras de {nombre}.")
+        elif mode == "motion":
+            if captured:
+                status_var.set(
+                    f"Movimiento de {nombre} guardado. Repite la captura varias veces desde posiciones ligeramente distintas."
+                )
+            # Si captured == 0, capturar_paso ya dejó un mensaje explicando el problema.
         elif mode == "continuous":
             status_var.set(f"Captura continua terminada: {captured} muestras de {nombre}.")
         else:
@@ -3674,12 +4489,93 @@ def abrir_ventana_entrenamiento():
         if not capture_job["running"]:
             return
 
+        # Una muestra dinámica es un CLIP completo, no una colección de
+        # fotogramas independientes. Guardamos el orden temporal de los frames.
+        if capture_job["mode"] == "motion":
+            nombre = capture_job["label"]
+            sample, frame_id = obtener_muestra_actual(
+                nombre,
+                capture_job["hand_filter"],
+                incluir_cara=capture_job.get("include_face", False),
+            )
+
+            if frame_id != capture_job["last_frame_id"]:
+                capture_job["last_frame_id"] = frame_id
+                now = time.perf_counter()
+
+                if sample is not None:
+                    if capture_job["motion_started_at"] == 0.0:
+                        capture_job["motion_started_at"] = now
+                    elapsed_save = now - capture_job["last_saved_time"]
+                    if capture_job["last_saved_time"] == 0.0 or elapsed_save >= 0.030:
+                        motion_frame = {
+                            "t": now - capture_job["motion_started_at"],
+                            "hands": sample["hands"],
+                        }
+                        if sample.get("face") is not None:
+                            motion_frame["face"] = sample["face"]
+                        capture_job["motion_frames"].append(motion_frame)
+                        capture_job["last_saved_time"] = now
+
+                    elapsed = now - capture_job["motion_started_at"]
+                    progress_var.set(
+                        f"Grabando movimiento: {min(100, int(elapsed / capture_job['motion_duration'] * 100))}%"
+                    )
+                    status_var.set(
+                        "Haz la seña completa: posición inicial → movimiento → posición final."
+                    )
+
+                    if elapsed >= capture_job["motion_duration"]:
+                        frames = list(capture_job["motion_frames"])
+                        feature = _vectorizar_secuencia_movimiento(frames)
+                        if feature is None or len(frames) < DYNAMIC_MIN_FRAMES:
+                            status_var.set(
+                                "No se pudo guardar: faltaron frames. Mantén la mano visible durante todo el movimiento."
+                            )
+                            capture_job["captured"] = 0
+                        elif feature["motion"] < DYNAMIC_MIN_MOTION:
+                            status_var.set(
+                                "Detecté muy poco movimiento. Repite la seña recorriendo su trayectoria completa."
+                            )
+                            capture_job["captured"] = 0
+                        elif capture_job.get("include_face", False) and (
+                            sum(1 for item in frames if item.get("face") is not None)
+                            < max(2, int(len(frames) * 0.40))
+                        ):
+                            status_var.set(
+                                "No vi el rostro durante suficiente parte del movimiento. "
+                                "Mira hacia la cámara y repite la seña."
+                            )
+                            capture_job["captured"] = 0
+                        else:
+                            capture_job["data"]["samples"].append({
+                                "label": nombre,
+                                "timestamp": time.time(),
+                                "type": "dynamic",
+                                "frames": frames,
+                            })
+                            capture_job["captured"] = 1
+                        terminar_captura(cancelado=False)
+                        return
+                else:
+                    progress_var.set("Esperando mano para iniciar el movimiento")
+                    status_var.set(
+                        f"Coloca la mano seleccionada ({capture_job['hand_filter'].lower()}) frente a la cámara."
+                    )
+
+            capture_job["after_id"] = win.after(1, capturar_paso)
+            return
+
         if capture_job["mode"] == "batch" and capture_job["captured"] >= capture_job["target"]:
             terminar_captura(cancelado=False)
             return
 
         nombre = capture_job["label"]
-        sample, frame_id = obtener_muestra_actual(nombre, capture_job["hand_filter"])
+        sample, frame_id = obtener_muestra_actual(
+            nombre,
+            capture_job["hand_filter"],
+            incluir_cara=capture_job.get("include_face", False),
+        )
 
         # Nunca repetimos un mismo frame procesado.
         if frame_id == capture_job["last_frame_id"]:
@@ -3690,6 +4586,11 @@ def abrir_ventana_entrenamiento():
         now = time.perf_counter()
 
         if sample is not None:
+            if capture_job.get("include_face", False) and "face" not in sample:
+                progress_var.set("Esperando rostro visible para guardar la muestra")
+                capture_job["after_id"] = win.after(5, capturar_paso)
+                return
+
             elapsed = now - capture_job["last_saved_time"]
             if capture_job["last_saved_time"] == 0.0 or elapsed >= capture_job["min_interval"]:
                 capture_job["data"]["samples"].append(sample)
@@ -3727,7 +4628,15 @@ def abrir_ventana_entrenamiento():
         capture_job["countdown_after_id"] = None
         capture_job["last_frame_id"] = -1
         capture_job["last_saved_time"] = 0.0
-        if capture_job["mode"] == "batch":
+        capture_job["motion_frames"] = []
+        capture_job["motion_started_at"] = 0.0
+        if capture_job["mode"] == "motion":
+            progress_var.set("Movimiento: esperando mano")
+            extra = " Mantén también el rostro visible." if capture_job.get("include_face") else ""
+            status_var.set(
+                "Cuando aparezca la mano, tendrás ~1.2 s para realizar la seña completa." + extra
+            )
+        elif capture_job["mode"] == "batch":
             progress_var.set(f"Capturando: 0/{capture_job['target']}")
             status_var.set(
                 "Capturando frames nuevos. Mantén la seña y haz pequeños cambios de posición."
@@ -3765,9 +4674,9 @@ def abrir_ventana_entrenamiento():
             return
 
         try:
-            target = int(cantidad_var.get()) if mode == "batch" else 0
+            target = int(cantidad_var.get()) if mode == "batch" else (1 if mode == "motion" else 0)
         except ValueError:
-            target = 30
+            target = 30 if mode == "batch" else (1 if mode == "motion" else 0)
 
         capture_job["running"] = True
         capture_job["mode"] = mode
@@ -3778,15 +4687,29 @@ def abrir_ventana_entrenamiento():
         capture_job["min_interval"] = intervalo_seleccionado()
         capture_job["label"] = nombre
         capture_job["hand_filter"] = hand_filter_var.get()
+        capture_job["include_face"] = bool(include_face_var.get()) and FACE_MESH_AVAILABLE
         capture_job["data"] = cargar_dataset(nombre)
+        capture_job["motion_frames"] = []
+        capture_job["motion_started_at"] = 0.0
 
         capture_one.configure(state="disabled")
+        try:
+            capture_motion.configure(state="disabled")
+        except (NameError, tk.TclError):
+            pass
         if mode == "batch":
             capture_many.configure(text="Detener captura")
             capture_continuous.configure(text="Captura continua")
-        else:
-            capture_many.configure(text=f"Capturar {target or cantidad_var.get()} muestras")
+        elif mode == "continuous":
+            capture_many.configure(text=f"Capturar {cantidad_var.get()} muestras")
             capture_continuous.configure(text="Detener captura")
+        else:  # motion
+            capture_many.configure(text=f"Capturar {cantidad_var.get()} muestras")
+            capture_continuous.configure(text="Captura continua")
+            try:
+                capture_motion.configure(text="Detener movimiento", state="normal")
+            except (NameError, tk.TclError):
+                pass
 
         countdown = segundos_countdown()
         if countdown > 0:
@@ -3799,6 +4722,10 @@ def abrir_ventana_entrenamiento():
 
     def capturar_continuo():
         preparar_captura("continuous")
+
+    def capturar_movimiento():
+        """Graba una ejecución completa de una seña dinámica (~1.2 s)."""
+        preparar_captura("motion")
 
     def guardar_modelo_como():
         """Exporta una copia del modelo entrenado a la ruta/nombre elegidos."""
@@ -3903,6 +4830,41 @@ def abrir_ventana_entrenamiento():
     )
 
     # ----------------------------------------------------------
+    # SEÑA CON MOVIMIENTO - SIEMPRE VISIBLE ARRIBA
+    # Se coloca antes de las opciones para que no quede recortada
+    # en pantallas de menor altura.
+    # ----------------------------------------------------------
+    capture_motion = tk.Button(
+        controls_panel,
+        text="🎥  CAPTURAR SEÑA CON MOVIMIENTO",
+        command=capturar_movimiento,
+        relief="flat", bd=0, highlightthickness=1,
+        bg=c["accent"], fg=c["accent_text"],
+        activebackground=c["button_active"], activeforeground=c["text"],
+        highlightbackground=c["border"],
+        font=("DejaVu Sans", 9, "bold"),
+        padx=12, pady=10, cursor="hand2",
+    )
+    capture_motion.pack(
+        fill="x",
+        pady=(0, 5),
+        before=options_shell,
+    )
+
+    motion_help = tk.Label(
+        controls_panel,
+        text="Graba una ejecución completa (~1.2 s). Repite 8–15 veces para mejorar precisión.",
+        bg=c["panel"], fg=c["muted"],
+        font=("DejaVu Sans", 8),
+        anchor="w", justify="left", wraplength=350,
+    )
+    motion_help.pack(
+        fill="x",
+        pady=(0, 8),
+        before=options_shell,
+    )
+
+    # ----------------------------------------------------------
     # BOTONES DE CAPTURA
     # ----------------------------------------------------------
     buttons = tk.Frame(controls_panel, bg=c["panel"])
@@ -3947,7 +4909,9 @@ def abrir_ventana_entrenamiento():
     )
     capture_continuous.pack(fill="x", pady=(0, 6))
 
+
     def cerrar_entrenamiento():
+        global face_training_requested
         # Si había una serie en curso, guarda lo ya capturado antes de cerrar.
         if capture_job["running"]:
             terminar_captura(cancelado=True)
@@ -3966,6 +4930,7 @@ def abrir_ventana_entrenamiento():
             except tk.TclError:
                 pass
         globals()["training_window"] = None
+        face_training_requested = False
         try:
             win.destroy()
         except tk.TclError:
@@ -4471,6 +5436,56 @@ for option in ("OFF", "Baja", "Media"):
 
     btn.bind("<Enter>", _stab_enter)
     btn.bind("<Leave>", _stab_leave)
+
+# ---------------- VISUALIZACIÓN DE LANDMARKS ----------------
+landmarks_separator = tk.Frame(settings_panel, height=1)
+landmarks_separator.pack(fill="x", padx=16, pady=(0, 14))
+
+landmarks_label = tk.Label(
+    settings_panel,
+    text="PUNTOS EN CÁMARA",
+    anchor="w",
+    font=("DejaVu Sans", 8, "bold"),
+)
+landmarks_label.pack(fill="x", padx=16, pady=(0, 7))
+
+landmarks_options = tk.Frame(settings_panel)
+landmarks_options.pack(fill="x", padx=16, pady=(0, 16))
+
+show_hand_points_check = tk.Checkbutton(
+    landmarks_options,
+    text="Mostrar puntos de las manos",
+    variable=show_hand_points_var,
+    command=actualizar_visibilidad_landmarks,
+    anchor="w",
+    font=("DejaVu Sans", 9, "bold"),
+    cursor="hand2",
+    bd=0,
+    highlightthickness=0,
+)
+show_hand_points_check.pack(fill="x", pady=(0, 5))
+
+show_face_points_check = tk.Checkbutton(
+    landmarks_options,
+    text="Mostrar puntos faciales",
+    variable=show_face_points_var,
+    command=actualizar_visibilidad_landmarks,
+    anchor="w",
+    font=("DejaVu Sans", 9, "bold"),
+    cursor="hand2",
+    bd=0,
+    highlightthickness=0,
+)
+show_face_points_check.pack(fill="x")
+
+landmarks_help = tk.Label(
+    settings_panel,
+    text="Estas opciones solo cambian lo que ves en la cámara; no desactivan la detección.",
+    anchor="w",
+    justify="left",
+    font=("DejaVu Sans", 8),
+)
+landmarks_help.pack(fill="x", padx=16, pady=(0, 14))
 
 # ---------------- ENTRENAMIENTO DE MODELO ----------------
 training_separator = tk.Frame(settings_panel, height=1)
