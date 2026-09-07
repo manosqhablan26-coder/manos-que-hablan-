@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import time
 import json
+import http.client
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -34,6 +35,35 @@ DRIVE_MODELS_PAGE_URL = "https://drive.google.com/drive/folders/1hrsKKJV7UN7mhhn
 GITHUB_LATEST_RELEASE_API = (
     f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 )
+
+# ==========================================================
+# SERVIDOR DE RECONOCIMIENTO · PYTHONANYWHERE
+# ==========================================================
+# PythonAnywhere queda como servidor de MODELOS, no como reconocedor por frame.
+# La app descarga los modelos una vez, los prepara y reconoce localmente en RAM.
+# /api/reconocer se conserva como endpoint de respaldo, pero no se usa durante la cámara.
+SERVER_RECOGNITION_ENABLED = False
+SERVER_RECOGNITION_URL = (
+    "https://Manosqhablan26.pythonanywhere.com/api/reconocer"
+)
+SERVER_MODELS_URL = (
+    "https://Manosqhablan26.pythonanywhere.com/api/modelos"
+)
+SERVER_MODEL_SYNC_ENABLED = True
+SERVER_MODEL_SYNC_TIMEOUT = 20.0
+
+# Estos valores quedan disponibles por compatibilidad si más adelante vuelves a activar
+# el reconocimiento remoto, pero con SERVER_RECOGNITION_ENABLED=False no añaden delay.
+# Reconocimiento remoto de baja latencia. Solo existe una petición en vuelo a la vez,
+# así que no se acumulan solicitudes aunque Internet responda más lento que el intervalo.
+SERVER_REQUEST_INTERVAL = 0.08
+SERVER_RESULT_MAX_AGE = 0.45
+SERVER_TIMEOUT = 0.80
+
+# Evita que la letra parpadee si una sola respuesta del servidor llega sin coincidencia.
+# La primera deteccion se muestra inmediatamente; solo se conserva brevemente la ultima
+# seña valida durante huecos muy cortos de reconocimiento.
+RECOGNITION_DISPLAY_HOLD_SECONDS = 0.22
 
 # ==========================================================
 # MODELO DE SEÑAS EN GITHUB · SIN DELAY EN LA CÁMARA
@@ -152,6 +182,16 @@ cargar_historial_local()
 
 model_online_version = None
 model_sync_in_progress = False
+
+# Estado visual de la sincronización de modelos. Se usa para la barra superior.
+model_sync_visual_state = "idle"
+model_sync_last_progress = 0.0
+
+# Cola segura para comunicar el hilo de descarga con Tkinter.
+# IMPORTANTE: el hilo secundario nunca toca widgets ni llama root.after().
+# Solo deja aquí el estado; Tkinter lo consume desde el hilo principal.
+model_sync_ui_queue = queue.Queue()
+model_sync_ui_poller_running = False
 
 # Información de la última versión encontrada.
 latest_release_info = None
@@ -315,6 +355,20 @@ dynamic_last_result = (None, 0.0)
 recognition_enabled = False
 latest_recognized_sign = None
 latest_recognition_confidence = 0.0
+
+# Reconocimiento remoto. El servidor nunca se consulta desde process_frames();
+# un hilo independiente conserva la última respuesta disponible.
+server_thread = None
+server_recognized_sign = None
+server_recognition_confidence = 0.0
+server_result_time = 0.0
+server_online = False
+
+# Filtro visual anti-parpadeo. No retrasa una deteccion nueva: solo mantiene
+# brevemente la ultima seña correcta cuando aparece un hueco de reconocimiento.
+recognition_display_sign = None
+recognition_display_confidence = 0.0
+recognition_display_time = 0.0
 
 # Últimos landmarks ya procesados por el hilo principal de MediaPipe.
 # La ventana de entrenamiento reutiliza estos datos para capturar muestras
@@ -1105,6 +1159,405 @@ def sincronizar_modelo_github():
     ).start()
 
 
+def sincronizar_modelos_servidor():
+    """
+    Sincroniza y VALIDA los modelos de PythonAnywhere antes de activarlos.
+
+    La barra representa estados reales:
+    conexión HTTPS -> descarga -> validación -> carga en RAM -> listo.
+    Si algo falla, muestra el motivo y solo usa la caché local si es válida.
+    """
+    global model_sync_in_progress
+
+    if not SERVER_MODEL_SYNC_ENABLED or model_sync_in_progress:
+        return
+
+    model_sync_in_progress = True
+    actualizar_barra_modelos("connecting", 0, "Conectando con PythonAnywhere...")
+
+    def activar_en_ram(data, version=None, origen="servidor", mostrar_barra=True,
+                       archivos_validos=None, muestras_servidor=None):
+        global recognition_enabled
+
+        ok = _activar_modelo_online(
+            data,
+            MODEL_CACHE_FILE,
+            version=version,
+        )
+
+        if not ok:
+            return False
+
+        recognition_enabled = bool(recognition_model_samples)
+        if not recognition_enabled:
+            return False
+
+        labels = sorted({
+            item.get("label")
+            for item in recognition_model_samples
+            if isinstance(item, dict) and item.get("label")
+        })
+        sample_count = len(recognition_model_samples)
+
+        if not labels or sample_count <= 0:
+            recognition_enabled = False
+            return False
+
+        print(
+            f"[MODELOS] {origen}: {len(labels)} seña(s), "
+            f"{sample_count} muestra(s), recognition_enabled={recognition_enabled}"
+        )
+
+        def actualizar_estado():
+            try:
+                set_status(
+                    f"Modelos de {origen} verificados y cargados en RAM · "
+                    f"{len(labels)} seña(s), {sample_count} muestra(s)."
+                )
+            except Exception:
+                pass
+
+        try:
+            root.after(0, actualizar_estado)
+        except Exception:
+            pass
+
+        if mostrar_barra:
+            cantidad_archivos = (
+                len(archivos_validos)
+                if isinstance(archivos_validos, list)
+                else 0
+            )
+            total_reportado = (
+                int(muestras_servidor)
+                if isinstance(muestras_servidor, int)
+                else sample_count
+            )
+            detalle_archivos = (
+                f"{cantidad_archivos} archivos verificados · "
+                if cantidad_archivos > 0
+                else ""
+            )
+            actualizar_barra_modelos(
+                "ready",
+                100,
+                f"✓ Conexión correcta · {detalle_archivos}"
+                f"{sample_count}/{total_reportado} muestras válidas · Modelos en RAM",
+            )
+
+        return True
+
+    def worker():
+        global model_sync_in_progress
+        global recognition_enabled
+
+        modelo_activo = False
+
+        # ------------------------------------------------------
+        # 1) CARGAR CACHÉ LOCAL, PERO SOLO SI ES VÁLIDA
+        # ------------------------------------------------------
+        if MODEL_CACHE_FILE.exists():
+            try:
+                datos_cache = _leer_json_modelo(MODEL_CACHE_FILE)
+                preparados_cache = _preparar_muestras_reconocimiento(datos_cache)
+                if preparados_cache:
+                    manifest_cache = _leer_manifest_local_modelo()
+                    version_cache = (
+                        str(manifest_cache.get("version", "")).strip() or None
+                    )
+                    modelo_activo = activar_en_ram(
+                        datos_cache,
+                        version=version_cache,
+                        origen="caché local",
+                        mostrar_barra=False,
+                    )
+            except Exception as exc:
+                print(f"[MODELOS] Caché local inválida: {exc}")
+
+        # ------------------------------------------------------
+        # 2) CONEXIÓN REAL CON PYTHONANYWHERE
+        # ------------------------------------------------------
+        try:
+            actualizar_barra_modelos(
+                "connecting",
+                2,
+                "Conectando con PythonAnywhere...",
+            )
+
+            request_modelos = urllib.request.Request(
+                SERVER_MODELS_URL,
+                headers={
+                    "User-Agent": f"ManosQueHablan/{APP_VERSION}",
+                    "Accept": "application/json",
+                    "Cache-Control": "no-cache",
+                },
+            )
+
+            with urllib.request.urlopen(
+                request_modelos,
+                timeout=SERVER_MODEL_SYNC_TIMEOUT,
+            ) as response:
+                status_http = getattr(response, "status", None) or response.getcode()
+                if int(status_http) != 200:
+                    raise ValueError(f"Servidor respondió HTTP {status_http}")
+
+                actualizar_barra_modelos(
+                    "connected",
+                    8,
+                    "✓ Servidor conectado correctamente · iniciando descarga...",
+                )
+
+                total = 0
+                try:
+                    total = int(response.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    total = 0
+
+                partes = []
+                recibidos = 0
+                ultimo_porcentaje = -1
+
+                if total > 0:
+                    actualizar_barra_modelos(
+                        "downloading",
+                        8,
+                        "Descargando modelos... 0%",
+                    )
+                else:
+                    actualizar_barra_modelos(
+                        "downloading_indeterminate",
+                        None,
+                        "✓ Servidor conectado · descargando modelos...",
+                    )
+
+                while True:
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+
+                    partes.append(chunk)
+                    recibidos += len(chunk)
+
+                    if total > 0:
+                        # La descarga ocupa visualmente del 8% al 82%.
+                        descarga_pct = min(100.0, recibidos * 100.0 / total)
+                        barra_pct = 8.0 + (descarga_pct * 0.74)
+                        porcentaje_entero = int(descarga_pct)
+                        if porcentaje_entero != ultimo_porcentaje:
+                            ultimo_porcentaje = porcentaje_entero
+                            actualizar_barra_modelos(
+                                "downloading",
+                                barra_pct,
+                                f"Descargando modelos... {porcentaje_entero}%",
+                            )
+
+                raw = b"".join(partes)
+
+            if not raw:
+                raise ValueError("El servidor devolvió una descarga vacía")
+
+            # ------------------------------------------------------
+            # 3) VALIDACIÓN REAL DEL JSON Y DE LOS ARCHIVOS
+            # ------------------------------------------------------
+            actualizar_barra_modelos(
+                "verifying",
+                86,
+                "Descarga completa · verificando archivos y muestras...",
+            )
+
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception as exc:
+                raise ValueError(f"JSON descargado dañado o inválido: {exc}") from exc
+
+            if not isinstance(payload, dict):
+                raise ValueError("La respuesta del servidor no es un objeto JSON")
+
+            if payload.get("ok") is not True:
+                error_servidor = str(payload.get("error", "")).strip()
+                raise ValueError(
+                    error_servidor or "PythonAnywhere indicó que la respuesta no es válida"
+                )
+
+            archivos = payload.get("files", [])
+            if not isinstance(archivos, list) or not archivos:
+                raise ValueError("El servidor no informó ningún archivo de modelo")
+
+            archivos_limpios = [str(nombre).strip() for nombre in archivos]
+            archivos_invalidos = [
+                nombre for nombre in archivos_limpios
+                if not nombre or not nombre.lower().endswith(".json")
+            ]
+            if archivos_invalidos:
+                raise ValueError(
+                    "Hay archivos de modelo inválidos: "
+                    + ", ".join(archivos_invalidos[:3])
+                )
+
+            file_count_reportado = payload.get("file_count")
+            if file_count_reportado is not None:
+                try:
+                    file_count_reportado = int(file_count_reportado)
+                except (TypeError, ValueError):
+                    raise ValueError("file_count del servidor no es válido")
+                if file_count_reportado != len(archivos_limpios):
+                    raise ValueError(
+                        f"El servidor reporta {file_count_reportado} archivos, "
+                        f"pero entregó {len(archivos_limpios)}"
+                    )
+
+            samples = payload.get("samples", [])
+            if not isinstance(samples, list) or not samples:
+                raise ValueError("El servidor no devolvió muestras de reconocimiento")
+
+            sample_count_reportado = payload.get("sample_count")
+            if sample_count_reportado is not None:
+                try:
+                    sample_count_reportado = int(sample_count_reportado)
+                except (TypeError, ValueError):
+                    raise ValueError("sample_count del servidor no es válido")
+                if sample_count_reportado != len(samples):
+                    raise ValueError(
+                        f"El servidor reporta {sample_count_reportado} muestras, "
+                        f"pero entregó {len(samples)}"
+                    )
+            else:
+                sample_count_reportado = len(samples)
+
+            datos_modelo = {
+                "version": 1,
+                "samples": samples,
+            }
+
+            prepared = _preparar_muestras_reconocimiento(datos_modelo)
+            if not prepared:
+                raise ValueError("Ninguna muestra descargada es reconocible")
+
+            if len(prepared) != len(samples):
+                raise ValueError(
+                    f"Se encontraron muestras dañadas o incompatibles: "
+                    f"{len(prepared)}/{len(samples)} son válidas"
+                )
+
+            etiquetas = sorted({
+                item.get("label")
+                for item in prepared
+                if isinstance(item, dict) and item.get("label")
+            })
+            if not etiquetas:
+                raise ValueError("Los modelos no contienen etiquetas de señas válidas")
+
+            actualizar_barra_modelos(
+                "validated",
+                94,
+                f"✓ Archivos verificados · {len(archivos_limpios)} JSON · "
+                f"{len(prepared)} muestras válidas",
+            )
+
+            # ------------------------------------------------------
+            # 4) GUARDAR CACHÉ VALIDADA Y CARGAR EN RAM
+            # ------------------------------------------------------
+            actualizar_barra_modelos(
+                "processing",
+                97,
+                "Archivos correctos · cargando modelos en RAM...",
+            )
+
+            version_remota = (
+                str(payload.get("model_version", "")).strip() or None
+            )
+
+            modelo_raw = json.dumps(
+                datos_modelo,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            _guardar_modelo_atomico(MODEL_CACHE_FILE, modelo_raw)
+
+            manifest = {
+                "source": "pythonanywhere",
+                "version": version_remota or "",
+                "files": archivos_limpios,
+                "sample_count": len(samples),
+                "validated_sample_count": len(prepared),
+                "synced_at": time.time(),
+            }
+            _guardar_modelo_atomico(
+                MODEL_CACHE_MANIFEST,
+                json.dumps(
+                    manifest,
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8"),
+            )
+
+            modelo_activo = activar_en_ram(
+                datos_modelo,
+                version=version_remota,
+                origen="PythonAnywhere",
+                mostrar_barra=True,
+                archivos_validos=archivos_limpios,
+                muestras_servidor=sample_count_reportado,
+            ) or modelo_activo
+
+            if not modelo_activo:
+                raise ValueError("Los archivos son válidos, pero no pudieron activarse en RAM")
+
+        except Exception as exc:
+            mensaje_error = str(exc).strip() or exc.__class__.__name__
+            print(f"[MODELOS] Error sincronizando PythonAnywhere: {mensaje_error}")
+
+            if recognition_model_samples:
+                recognition_enabled = True
+                modelo_activo = True
+
+            def mostrar_respaldo():
+                try:
+                    if modelo_activo:
+                        set_status(
+                            f"PythonAnywhere no disponible · usando modelos locales válidos"
+                        )
+                    else:
+                        set_status(
+                            f"Error de modelos: {mensaje_error}",
+                            error=True,
+                        )
+                except Exception:
+                    pass
+
+            try:
+                root.after(0, mostrar_respaldo)
+            except Exception:
+                pass
+
+            if modelo_activo:
+                labels = sorted({
+                    item.get("label")
+                    for item in recognition_model_samples
+                    if isinstance(item, dict) and item.get("label")
+                })
+                actualizar_barra_modelos(
+                    "offline",
+                    100,
+                    f"⚠ Sin conexión al servidor · modelos locales válidos · "
+                    f"{len(labels)} señas disponibles",
+                )
+            else:
+                actualizar_barra_modelos(
+                    "error",
+                    0,
+                    f"✗ No se pudieron validar/cargar los modelos · {mensaje_error}",
+                )
+
+        finally:
+            model_sync_in_progress = False
+
+    threading.Thread(
+        target=worker,
+        daemon=True,
+        name="ServerModelSync",
+    ).start()
+
 def reconocer_sena(hands_data, face_data=None):
     """Reconoce manos y usa la cara solo en modelos entrenados con ella."""
     model_samples = recognition_model_samples
@@ -1458,6 +1911,159 @@ def process_face_frames():
 
 
 # ==========================================================
+# RECONOCIMIENTO REMOTO · PYTHONANYWHERE
+# ==========================================================
+
+def server_recognition_worker():
+    """Envía los landmarks más recientes al servidor con conexión HTTPS reutilizable."""
+    global server_recognized_sign
+    global server_recognition_confidence
+    global server_result_time
+    global server_online
+
+    parsed_url = urllib.parse.urlsplit(SERVER_RECOGNITION_URL)
+    server_host = parsed_url.hostname
+    server_port = parsed_url.port or 443
+    server_path = parsed_url.path or "/"
+    if parsed_url.query:
+        server_path += "?" + parsed_url.query
+
+    connection = None
+    last_request_started = 0.0
+
+    def close_connection():
+        nonlocal connection
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+            connection = None
+
+    while running:
+        now = time.perf_counter()
+        remaining = SERVER_REQUEST_INTERVAL - (now - last_request_started)
+
+        if remaining > 0:
+            time.sleep(min(remaining, 0.01))
+            continue
+
+        with lock:
+            # Siempre tomamos la muestra MÁS RECIENTE. No existe una cola de frames
+            # pendientes; si la red va lenta, los estados intermedios se descartan.
+            hands_data = [
+                {
+                    "handedness": str(hand.get("handedness", "Unknown")),
+                    "landmarks": [dict(lm) for lm in hand.get("landmarks", [])],
+                }
+                for hand in latest_recognition_hands_data
+                if isinstance(hand, dict)
+            ]
+
+        if not hands_data:
+            with lock:
+                server_recognized_sign = None
+                server_recognition_confidence = 0.0
+                server_result_time = 0.0
+            time.sleep(0.01)
+            continue
+
+        # El reloj empieza AQUÍ, antes de enviar la pose. Así una respuesta que tardó
+        # mucho en viajar no se considera recién capturada cuando vuelve.
+        request_started = time.perf_counter()
+        last_request_started = request_started
+
+        try:
+            payload = json.dumps(
+                {"hands": hands_data},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": f"ManosQueHablan/{APP_VERSION}",
+                "Content-Length": str(len(payload)),
+                "Connection": "keep-alive",
+            }
+
+            response_data = None
+
+            # Primer intento usa/reutiliza la conexión actual. Si el servidor cerró
+            # el keep-alive, se reconecta una sola vez sin generar una cola nueva.
+            for attempt in range(2):
+                try:
+                    if connection is None:
+                        connection = http.client.HTTPSConnection(
+                            server_host,
+                            server_port,
+                            timeout=SERVER_TIMEOUT,
+                        )
+
+                    connection.request(
+                        "POST",
+                        server_path,
+                        body=payload,
+                        headers=headers,
+                    )
+                    response = connection.getresponse()
+                    raw = response.read()
+
+                    if response.status != 200:
+                        raise ValueError(
+                            f"Servidor HTTP {response.status}"
+                        )
+
+                    response_data = json.loads(raw.decode("utf-8"))
+
+                    # Algunos hosts cierran explícitamente la conexión. En ese caso
+                    # la siguiente petición abrirá una nueva automáticamente.
+                    if str(response.getheader("Connection", "")).lower() == "close":
+                        close_connection()
+
+                    break
+
+                except (
+                    OSError,
+                    TimeoutError,
+                    http.client.HTTPException,
+                ):
+                    close_connection()
+                    if attempt >= 1:
+                        raise
+
+            if not isinstance(response_data, dict) or not response_data.get("ok"):
+                raise ValueError("Respuesta no válida del servidor")
+
+            sign = response_data.get("sign")
+            sign = str(sign).strip().upper() if sign else None
+
+            try:
+                confidence = float(response_data.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+
+            with lock:
+                server_recognized_sign = sign
+                server_recognition_confidence = confidence
+                # Importante: fecha de la MUESTRA enviada, no de la respuesta recibida.
+                server_result_time = request_started
+                server_online = True
+
+        except Exception:
+            close_connection()
+            # Si Internet/servidor falla, el reconocimiento local queda como respaldo.
+            with lock:
+                server_online = False
+                server_recognized_sign = None
+                server_recognition_confidence = 0.0
+                server_result_time = 0.0
+
+    close_connection()
+
+
+# ==========================================================
 # PROCESAMIENTO MEDIAPIPE EN HILO INDEPENDIENTE
 # ==========================================================
 
@@ -1474,6 +2080,9 @@ def process_frames():
     global latest_recognition_hands_data
     global dynamic_recognition_tick
     global dynamic_last_result
+    global recognition_display_sign
+    global recognition_display_confidence
+    global recognition_display_time
 
     processed_id = -1
 
@@ -1609,6 +2218,13 @@ def process_frames():
             dynamic_recognition_buffer.clear()
             dynamic_last_result = (None, 0.0)
 
+        # ------------------------------------------------------
+        # RECONOCIMIENTO HÍBRIDO: servidor primero + local de respaldo
+        # ------------------------------------------------------
+        local_sign = None
+        local_confidence = 0.0
+
+        # El reconocimiento local original se conserva intacto como respaldo.
         if recognition_enabled and recognition_hands_data and recognition_model_samples:
             static_sign, static_confidence = reconocer_sena(
                 recognition_hands_data,
@@ -1622,16 +2238,59 @@ def process_frames():
 
             dynamic_sign, dynamic_confidence = dynamic_last_result
 
-            # Cuando una trayectoria dinámica encaja con suficiente seguridad,
-            # tiene prioridad sobre una pose intermedia que podría parecer estática.
             if dynamic_sign and dynamic_confidence >= max(62.0, static_confidence - 4.0):
-                recognized_sign = dynamic_sign
-                recognition_confidence = dynamic_confidence
+                local_sign = dynamic_sign
+                local_confidence = dynamic_confidence
             else:
-                recognized_sign = static_sign
-                recognition_confidence = static_confidence
+                local_sign = static_sign
+                local_confidence = static_confidence
+
+        # Leer únicamente la última respuesta ya recibida. Aquí NO hay Internet,
+        # por eso process_frames() nunca espera al servidor.
+        with lock:
+            remote_sign = server_recognized_sign
+            remote_confidence = server_recognition_confidence
+            remote_time = server_result_time
+
+        remote_is_recent = (
+            SERVER_RECOGNITION_ENABLED
+            and recognition_hands_data
+            and remote_sign
+            and remote_time > 0
+            and (time.perf_counter() - remote_time) <= SERVER_RESULT_MAX_AGE
+        )
+
+        if remote_is_recent:
+            raw_recognized_sign = remote_sign
+            raw_recognition_confidence = remote_confidence
         else:
-            recognized_sign, recognition_confidence = None, 0.0
+            raw_recognized_sign = local_sign
+            raw_recognition_confidence = local_confidence
+
+        # Anti-parpadeo sin agregar demora a la primera deteccion.
+        # Si llega una seña valida, se muestra de inmediato. Si solo uno o dos
+        # resultados vienen vacios, conservamos la ultima seña por 220 ms.
+        recognition_now = time.perf_counter()
+
+        if raw_recognized_sign:
+            recognition_display_sign = raw_recognized_sign
+            recognition_display_confidence = raw_recognition_confidence
+            recognition_display_time = recognition_now
+            recognized_sign = raw_recognized_sign
+            recognition_confidence = raw_recognition_confidence
+        elif (
+            recognition_display_sign
+            and (recognition_now - recognition_display_time)
+            <= RECOGNITION_DISPLAY_HOLD_SECONDS
+        ):
+            recognized_sign = recognition_display_sign
+            recognition_confidence = recognition_display_confidence
+        else:
+            recognition_display_sign = None
+            recognition_display_confidence = 0.0
+            recognition_display_time = 0.0
+            recognized_sign = None
+            recognition_confidence = raw_recognition_confidence
 
         cv2.putText(
             frame,
@@ -1684,6 +2343,7 @@ def iniciar_camara():
     global capture_thread
     global processing_thread
     global face_thread
+    global server_thread
     global running
     global latest_frame
     global latest_frame_id
@@ -1697,6 +2357,13 @@ def iniciar_camara():
     global last_capture_time
     global last_process_time
     global last_display_time
+    global server_recognized_sign
+    global server_recognition_confidence
+    global server_result_time
+    global server_online
+    global recognition_display_sign
+    global recognition_display_confidence
+    global recognition_display_time
 
     detener_camara()
 
@@ -1741,6 +2408,13 @@ def iniciar_camara():
         globals()["latest_face_features"] = None
         globals()["latest_face_frame_id"] = -1
         globals()["latest_face_time"] = 0.0
+        server_recognized_sign = None
+        server_recognition_confidence = 0.0
+        server_result_time = 0.0
+        server_online = False
+        recognition_display_sign = None
+        recognition_display_confidence = 0.0
+        recognition_display_time = 0.0
 
     camera_fps = 0.0
     mediapipe_fps = 0.0
@@ -1767,6 +2441,14 @@ def iniciar_camara():
         name="MediaPipeProcessing"
     )
 
+    server_thread = None
+    if SERVER_RECOGNITION_ENABLED:
+        server_thread = threading.Thread(
+            target=server_recognition_worker,
+            daemon=True,
+            name="ServerRecognition",
+        )
+
     face_thread = None
     if FACE_MESH_AVAILABLE:
         face_thread = threading.Thread(
@@ -1777,6 +2459,8 @@ def iniciar_camara():
 
     capture_thread.start()
     processing_thread.start()
+    if server_thread is not None:
+        server_thread.start()
     if face_thread is not None:
         face_thread.start()
 
@@ -1803,6 +2487,7 @@ def detener_camara():
     global capture_thread
     global processing_thread
     global face_thread
+    global server_thread
     global latest_frame
     global latest_processed_frame
     global latest_face_features
@@ -1810,6 +2495,9 @@ def detener_camara():
     global latest_face_time
     global latest_face_overlay_points
     global latest_face_overlay_frame_id
+    global recognition_display_sign
+    global recognition_display_confidence
+    global recognition_display_time
 
     running = False
 
@@ -1822,6 +2510,10 @@ def detener_camara():
         processing_thread.join(timeout=0.7)
 
     processing_thread = None
+
+    if server_thread is not None and server_thread.is_alive():
+        server_thread.join(timeout=SERVER_TIMEOUT + 0.3)
+    server_thread = None
 
     if face_thread is not None and face_thread.is_alive():
         face_thread.join(timeout=0.5)
@@ -1838,6 +2530,9 @@ def detener_camara():
         latest_face_time = 0.0
         latest_face_overlay_points = []
         latest_face_overlay_frame_id = -1
+        recognition_display_sign = None
+        recognition_display_confidence = 0.0
+        recognition_display_time = 0.0
 
     dynamic_recognition_buffer.clear()
 
@@ -1882,6 +2577,162 @@ def set_status(text, error=False):
         text=text,
         fg=theme["danger"] if error else theme["muted"]
     )
+
+
+def actualizar_barra_modelos(estado, progreso=None, detalle=None):
+    """Encola un estado de la barra sin tocar Tkinter desde hilos secundarios."""
+    estado = str(estado or "idle").lower()
+
+    if progreso is not None:
+        try:
+            progreso = max(0.0, min(100.0, float(progreso)))
+        except (TypeError, ValueError):
+            progreso = None
+
+    try:
+        model_sync_ui_queue.put_nowait((estado, progreso, detalle))
+    except Exception:
+        pass
+
+
+def _aplicar_barra_modelos_en_tk(estado, progreso=None, detalle=None):
+    """Aplica UN estado a los widgets. Esta función solo corre en el hilo Tk."""
+    global model_sync_visual_state, model_sync_last_progress
+
+    if "model_sync_progress" not in globals() or "model_sync_label" not in globals():
+        return
+
+    estado = str(estado or "idle").lower()
+    if progreso is not None:
+        try:
+            progreso = max(0.0, min(100.0, float(progreso)))
+        except (TypeError, ValueError):
+            progreso = None
+
+    model_sync_visual_state = estado
+    if progreso is not None:
+        model_sync_last_progress = progreso
+
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    barra = model_sync_progress
+    etiqueta = model_sync_label
+
+    # Siempre detener la animación anterior antes de cambiar de estado.
+    try:
+        barra.stop()
+    except Exception:
+        pass
+
+    if estado in ("connecting", "downloading_indeterminate"):
+        barra.configure(mode="indeterminate", maximum=100)
+        barra.start(12)
+        texto = detalle or (
+            "Conectando con PythonAnywhere..."
+            if estado == "connecting"
+            else "Descargando modelos..."
+        )
+        etiqueta.configure(text=texto, fg=c["muted"])
+
+    elif estado == "connected":
+        valor = model_sync_last_progress if progreso is None else progreso
+        barra.configure(mode="determinate", maximum=100, value=valor)
+        etiqueta.configure(
+            text=detalle or "✓ Servidor conectado correctamente",
+            fg=c["ok"],
+        )
+
+    elif estado == "downloading":
+        valor = model_sync_last_progress if progreso is None else progreso
+        barra.configure(mode="determinate", maximum=100, value=valor)
+        etiqueta.configure(
+            text=detalle or f"Descargando modelos... {valor:.0f}%",
+            fg=c["muted"],
+        )
+
+    elif estado == "verifying":
+        valor = model_sync_last_progress if progreso is None else progreso
+        barra.configure(mode="determinate", maximum=100, value=valor)
+        etiqueta.configure(
+            text=detalle or "Verificando archivos y muestras...",
+            fg=c["muted"],
+        )
+
+    elif estado == "validated":
+        valor = model_sync_last_progress if progreso is None else progreso
+        barra.configure(mode="determinate", maximum=100, value=valor)
+        etiqueta.configure(
+            text=detalle or "✓ Archivos de modelos verificados",
+            fg=c["ok"],
+        )
+
+    elif estado == "processing":
+        valor = model_sync_last_progress if progreso is None else progreso
+        valor = max(92.0, valor)
+        barra.configure(mode="determinate", maximum=100, value=valor)
+        etiqueta.configure(
+            text=detalle or "Preparando modelos en RAM...",
+            fg=c["muted"],
+        )
+
+    elif estado == "ready":
+        model_sync_last_progress = 100.0
+        barra.configure(mode="determinate", maximum=100, value=100)
+        etiqueta.configure(
+            text=detalle or "✓ Modelos conectados, verificados y listos",
+            fg=c["ok"],
+        )
+
+    elif estado == "offline":
+        model_sync_last_progress = 100.0
+        barra.configure(mode="determinate", maximum=100, value=100)
+        etiqueta.configure(
+            text=detalle or "⚠ Sin conexión · usando modelos locales válidos",
+            fg=c["accent"],
+        )
+
+    elif estado == "error":
+        model_sync_last_progress = 0.0
+        barra.configure(mode="determinate", maximum=100, value=0)
+        etiqueta.configure(
+            text=detalle or "✗ Error al validar/cargar modelos",
+            fg=c["danger"],
+        )
+
+    else:
+        barra.configure(
+            mode="determinate",
+            maximum=100,
+            value=model_sync_last_progress,
+        )
+        etiqueta.configure(
+            text=detalle or "Modelos: preparando...",
+            fg=c["muted"],
+        )
+
+
+def procesar_cola_barra_modelos():
+    """Consume la cola desde Tkinter y garantiza que el estado MÁS NUEVO gane."""
+    global model_sync_ui_poller_running
+    model_sync_ui_poller_running = True
+
+    ultimo = None
+    try:
+        while True:
+            ultimo = model_sync_ui_queue.get_nowait()
+    except queue.Empty:
+        pass
+    except Exception:
+        ultimo = None
+
+    if ultimo is not None:
+        estado, progreso, detalle = ultimo
+        _aplicar_barra_modelos_en_tk(estado, progreso, detalle)
+
+    # Este root.after SIEMPRE se ejecuta desde el hilo principal de Tkinter.
+    try:
+        root.after(40, procesar_cola_barra_modelos)
+    except Exception:
+        model_sync_ui_poller_running = False
 
 
 # ==========================================================
@@ -2024,7 +2875,7 @@ def actualizar_video():
             if hand_count > 0:
                 detection_value.configure(text="Detectando", fg=c["ok"])
 
-                if recognition_model_samples:
+                if recognition_model_samples or SERVER_RECOGNITION_ENABLED:
                     if recognized_sign:
                         if "translation_status_value" in globals():
                             translation_status_value.configure(
@@ -2078,21 +2929,38 @@ def actualizar_video():
             else:
                 detection_value.configure(text="En espera", fg=c["muted"])
 
-                if "actualizar_oracion_detectada" in globals():
-                    actualizar_oracion_detectada(None, sin_manos=True)
+                # Si MediaPipe pierde la mano durante un unico frame pero el filtro
+                # anti-parpadeo aun conserva una seña valida, no borres la letra.
+                if recognized_sign:
+                    if "translation_status_value" in globals():
+                        translation_status_value.configure(
+                            text="Reconocida",
+                            fg=c["ok"],
+                        )
+                    translation_value.configure(
+                        text=recognized_sign,
+                        fg=c["text"],
+                    )
+                    if "translation_confidence_value" in globals():
+                        translation_confidence_value.configure(
+                            text=f"{recognition_confidence:.0f}%"
+                        )
+                else:
+                    if "actualizar_oracion_detectada" in globals():
+                        actualizar_oracion_detectada(None, sin_manos=True)
 
-                if "translation_status_value" in globals():
-                    translation_status_value.configure(
-                        text="En espera",
+                    if "translation_status_value" in globals():
+                        translation_status_value.configure(
+                            text="En espera",
+                            fg=c["muted"],
+                        )
+
+                    translation_value.configure(
+                        text="Esperando una seña...",
                         fg=c["muted"],
                     )
-
-                translation_value.configure(
-                    text="Esperando una seña...",
-                    fg=c["muted"],
-                )
-                if "translation_confidence_value" in globals():
-                    translation_confidence_value.configure(text="--")
+                    if "translation_confidence_value" in globals():
+                        translation_confidence_value.configure(text="--")
 
             photo = frame_to_photo(frame)
 
@@ -2714,6 +3582,29 @@ def apply_theme(theme_name=None):
         selectforeground=[("readonly", c["text"])],
     )
 
+    # Barra superior de sincronización de modelos.
+    style.configure(
+        "ModelSync.Horizontal.TProgressbar",
+        troughcolor=c["panel_alt"],
+        background=c["accent"],
+        bordercolor=c["border"],
+        lightcolor=c["accent"],
+        darkcolor=c["accent"],
+        thickness=7,
+    )
+
+    if "model_sync_frame" in globals():
+        model_sync_frame.configure(bg=c["topbar"])
+    if "model_sync_label" in globals():
+        estado_modelos = globals().get("model_sync_visual_state", "idle")
+        color_modelos = (
+            c["ok"] if estado_modelos in ("connected", "validated", "ready")
+            else c["accent"] if estado_modelos == "offline"
+            else c["danger"] if estado_modelos == "error"
+            else c["muted"]
+        )
+        model_sync_label.configure(bg=c["topbar"], fg=color_modelos)
+
     for widget, role in theme_widgets:
         try:
             if role == "bg":
@@ -3126,6 +4017,31 @@ brand_subtitle = tk.Label(
 
 header_controls = register_theme(tk.Frame(topbar), "topbar")
 header_controls.pack(side="right", padx=14, pady=5)
+
+# Indicador siempre visible del estado de los modelos. Se coloca a la izquierda
+# de los controles superiores para que pueda verse desde cualquier sección.
+model_sync_frame = register_theme(tk.Frame(topbar), "topbar")
+model_sync_frame.pack(side="right", padx=(6, 4), pady=5)
+
+model_sync_label = tk.Label(
+    model_sync_frame,
+    text="Modelos: preparando...",
+    font=("DejaVu Sans", 8, "bold"),
+    anchor="w",
+    width=62,
+)
+model_sync_label.pack(anchor="w", pady=(0, 2))
+
+model_sync_progress = ttk.Progressbar(
+    model_sync_frame,
+    style="ModelSync.Horizontal.TProgressbar",
+    orient="horizontal",
+    mode="determinate",
+    maximum=100,
+    value=0,
+    length=390,
+)
+model_sync_progress.pack(fill="x")
 
 theme_var = tk.StringVar(value="Sistema")
 stabilization_var = tk.StringVar(value="Baja")
@@ -8938,9 +9854,14 @@ monitor_system_theme()
 # Después GitHub se combina como fuente externa, sin reemplazar los locales.
 cargar_modelos_locales_entrenados(mostrar_estado=False)
 
-# Carga/actualiza el modelo desde GitHub en segundo plano.
-# No toca process_frames(), por lo que no añade delay a MediaPipe.
-sincronizar_modelo_github()
+# Inicia el consumidor de estados visuales EN EL HILO PRINCIPAL de Tkinter.
+# Así el hilo de red jamás modifica widgets directamente.
+if not model_sync_ui_poller_running:
+    root.after(10, procesar_cola_barra_modelos)
+
+# Carga/actualiza los modelos desde PythonAnywhere una sola vez al iniciar.
+# Después todo el reconocimiento se ejecuta localmente en RAM, sin viaje por Internet por frame.
+sincronizar_modelos_servidor()
 
 # La campanita comprueba una vez al iniciar si existe una versión nueva.
 # Se hace después de arrancar la interfaz y en un hilo aparte, sin bloquear cámara.
