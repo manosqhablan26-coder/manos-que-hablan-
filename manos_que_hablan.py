@@ -1,5 +1,6 @@
 import cv2
 import mediapipe as mp
+import numpy as np
 import threading
 import os
 import tkinter as tk
@@ -49,8 +50,18 @@ SERVER_RECOGNITION_URL = (
 SERVER_MODELS_URL = (
     "https://Manosqhablan26.pythonanywhere.com/api/modelos"
 )
+SERVER_STATUS_URL = (
+    "https://Manosqhablan26.pythonanywhere.com/api/status"
+)
 SERVER_MODEL_SYNC_ENABLED = True
 SERVER_MODEL_SYNC_TIMEOUT = 20.0
+
+# Actualización automática de modelos.
+# Se consulta /api/status en segundo plano; solo si detecta cambios se vuelve
+# a descargar /api/modelos. El reconocimiento de cámara continúa local en RAM.
+SERVER_MODEL_AUTO_UPDATE_ENABLED = True
+SERVER_MODEL_AUTO_UPDATE_INTERVAL = 30.0
+SERVER_MODEL_STATUS_TIMEOUT = 5.0
 
 # Estos valores quedan disponibles por compatibilidad si más adelante vuelves a activar
 # el reconocimiento remoto, pero con SERVER_RECOGNITION_ENABLED=False no añaden delay.
@@ -64,6 +75,31 @@ SERVER_TIMEOUT = 0.80
 # La primera deteccion se muestra inmediatamente; solo se conserva brevemente la ultima
 # seña valida durante huecos muy cortos de reconocimiento.
 RECOGNITION_DISPLAY_HOLD_SECONDS = 0.22
+
+# ==========================================================
+# CALIDAD DEL RECONOCIMIENTO · SIN AÑADIR RETRASO A LA PRIMERA SEÑA
+# ==========================================================
+# Mantiene los límites originales como base, pero evita mostrar una etiqueta
+# cuando otra clase está prácticamente a la misma distancia.
+STATIC_MAX_DISTANCE = 0.42
+STATIC_MIN_CONFIDENCE = 55.0
+STATIC_MIN_CLASS_MARGIN = 0.012
+STATIC_AMBIGUITY_CONFIDENCE_OVERRIDE = 84.0
+
+# Cuando ya hay una seña visible y aparece OTRA distinta, pedimos una segunda
+# confirmación únicamente para el CAMBIO. La primera detección sigue inmediata.
+RECOGNITION_SWITCH_CONFIRMATIONS = 2
+RECOGNITION_SWITCH_TIMEOUT_SECONDS = 0.14
+RECOGNITION_SWITCH_FAST_CONFIDENCE = 88.0
+RECOGNITION_SWITCH_FAST_MARGIN = 7.0
+
+# Filtro BALANCEADO SOLO para la entrada de señas ESTÁTICAS.
+# Evita que una postura intermedia durante el movimiento de la mano se muestre
+# como palabra, pero mantiene una respuesta ágil al llegar a la postura final.
+# No toca MediaPipe, DTW ni las señas dinámicas. Cada confirmación viene de un frame REAL.
+STATIC_ENTRY_STABLE_SECONDS = 0.10
+STATIC_ENTRY_CONFIRMATIONS = 3
+STATIC_ENTRY_TIMEOUT_SECONDS = 0.18
 
 # ==========================================================
 # MODELO DE SEÑAS EN GITHUB · SIN DELAY EN LA CÁMARA
@@ -182,6 +218,8 @@ cargar_historial_local()
 
 model_online_version = None
 model_sync_in_progress = False
+model_auto_update_check_in_progress = False
+model_auto_update_last_signature = None
 
 # Estado visual de la sincronización de modelos. Se usa para la barra superior.
 model_sync_visual_state = "idle"
@@ -198,10 +236,22 @@ latest_release_info = None
 # La campanita solo muestra el punto cuando existe una versión más nueva.
 update_notification_unread = False
 
-# Resolución SOLO para el procesamiento de MediaPipe.
-# La cámara visible conserva la resolución que entregue el dispositivo.
+# Resolución base usada por entrenamiento/importación de video.
+# Se conserva en 640x360 para NO cambiar la lógica ni la compatibilidad
+# de los modelos ya entrenados.
 PROCESS_WIDTH = 640
 PROCESS_HEIGHT = 360
+
+# ==========================================================
+# MODO TURBO V2 · BAJA LATENCIA EN CÁMARA EN VIVO
+# ==========================================================
+# Solo afecta el pipeline EN VIVO. Los JSON, el entrenamiento y los umbrales
+# de reconocimiento permanecen exactamente con su lógica original.
+TURBO_MODE_ENABLED = True
+TURBO_PROCESS_WIDTH = 432
+TURBO_PROCESS_HEIGHT = 243
+CAMERA_TARGET_FPS = 60.0
+UI_REFRESH_INTERVAL_MS = 8
 
 # Tamaño máximo de la vista previa dentro de la interfaz.
 # Esto NO cambia la resolución capturada por la cámara.
@@ -336,6 +386,11 @@ recognition_local_files = []
 # Contiene tanto muestras estáticas como secuencias dinámicas ya preparadas.
 recognition_model_samples = []
 
+# Índices NumPy preparados una sola vez al cargar/cambiar los modelos.
+# Evitan recorrer y restar punto por punto en Python durante cada frame.
+recognition_static_index = {}
+recognition_dynamic_index = {}
+
 # Reconocimiento temporal para señas que dependen del movimiento (por ejemplo J/Z
 # o palabras cuyo significado está en la trayectoria). El buffer conserva solo
 # landmarks; nunca guarda imágenes, por lo que el coste de memoria es pequeño.
@@ -344,7 +399,17 @@ DYNAMIC_BUFFER_MAX_FRAMES = 48
 DYNAMIC_MIN_FRAMES = 8
 DYNAMIC_MIN_MOTION = 0.030
 DYNAMIC_MAX_DISTANCE = 0.62
-DYNAMIC_RECOGNITION_EVERY = 3
+DYNAMIC_RECOGNITION_EVERY = 2
+
+# DTW dinámico: permite pequeñas variaciones de velocidad dentro de una misma
+# seña sin cambiar el formato JSON ni tocar MediaPipe. Para proteger los FPS,
+# primero se hace la comparación RMS vectorizada original y DTW se aplica solo
+# a una preselección pequeña de candidatos.
+DYNAMIC_DTW_ENABLED = True
+DYNAMIC_DTW_BAND = 3
+DYNAMIC_DTW_BLEND = 0.84
+DYNAMIC_DTW_CANDIDATES_PER_LABEL = 2
+DYNAMIC_DTW_MAX_CANDIDATES = 40
 dynamic_recognition_buffer = deque(maxlen=DYNAMIC_BUFFER_MAX_FRAMES)
 dynamic_recognition_tick = 0
 dynamic_last_result = (None, 0.0)
@@ -369,6 +434,20 @@ server_online = False
 recognition_display_sign = None
 recognition_display_confidence = 0.0
 recognition_display_time = 0.0
+
+# Estado mínimo para evitar que A -> B -> A cambie la interfaz por un único
+# frame ruidoso. No afecta a la primera seña detectada.
+recognition_switch_candidate = None
+recognition_switch_count = 0
+recognition_switch_time = 0.0
+
+# Estado del filtro de estabilidad de señas estáticas. Se mantiene separado del
+# filtro de cambio existente para no alterar la lógica de dinámicas ni letras.
+static_entry_candidate = None
+static_entry_count = 0
+static_entry_since = 0.0
+static_entry_last_seen = 0.0
+static_entry_approved = None
 
 # Últimos landmarks ya procesados por el hilo principal de MediaPipe.
 # La ventana de entrenamiento reutiliza estos datos para capturar muestras
@@ -565,6 +644,48 @@ def _dibujar_puntos_faciales(frame):
         )
 
 
+def _coseno_articulacion(points, a, b, c):
+    """Coseno del ángulo A-B-C; aporta flexión de dedos sin perder orientación."""
+    try:
+        ax, ay, az = points[a]
+        bx, by, bz = points[b]
+        cx, cy, cz = points[c]
+    except (IndexError, TypeError, ValueError):
+        return 0.0
+
+    bax, bay, baz = ax - bx, ay - by, az - bz
+    bcx, bcy, bcz = cx - bx, cy - by, cz - bz
+    norm_a = (bax * bax + bay * bay + baz * baz) ** 0.5
+    norm_c = (bcx * bcx + bcy * bcy + bcz * bcz) ** 0.5
+    denom = norm_a * norm_c
+    if denom < 1e-8:
+        return 0.0
+    value = (bax * bcx + bay * bcy + baz * bcz) / denom
+    return max(-1.0, min(1.0, float(value)))
+
+
+def _descriptor_flexion_dedos(points):
+    """15 ángulos articulares suaves que refuerzan la forma de cada dedo."""
+    chains = (
+        (0, 1, 2, 3, 4),
+        (0, 5, 6, 7, 8),
+        (0, 9, 10, 11, 12),
+        (0, 13, 14, 15, 16),
+        (0, 17, 18, 19, 20),
+    )
+    descriptor = []
+    # Peso moderado: ayuda a distinguir posturas parecidas sin dominar las
+    # coordenadas originales, que siguen conservando orientación de la palma.
+    ANGLE_WEIGHT = 0.35
+    for a, b, c, d, e in chains:
+        descriptor.extend((
+            _coseno_articulacion(points, a, b, c) * ANGLE_WEIGHT,
+            _coseno_articulacion(points, b, c, d) * ANGLE_WEIGHT,
+            _coseno_articulacion(points, c, d, e) * ANGLE_WEIGHT,
+        ))
+    return descriptor
+
+
 def _vector_reconocimiento(hands_data):
     """Convierte 1 o 2 manos a un vector comparable, independiente de posición/tamaño."""
     if not hands_data:
@@ -590,8 +711,9 @@ def _vector_reconocimiento(hands_data):
         wx, wy, wz = points[0]
         centered = [(x - wx, y - wy, z - wz) for x, y, z in points]
 
-        # Normalizamos el tamaño para que acercarse o alejarse de la cámara
-        # cambie lo menos posible el reconocimiento.
+        # Conservamos la normalización compatible con los JSON actuales.
+        # Los modelos se vuelven a preparar desde sus landmarks al cargarse,
+        # por lo que no se cambia el formato de los archivos guardados.
         scale = max(
             ((x * x + y * y + z * z) ** 0.5 for x, y, z in centered),
             default=0.0,
@@ -600,8 +722,15 @@ def _vector_reconocimiento(hands_data):
             return None
 
         vector = []
+        normalized_points = []
         for x, y, z in centered:
-            vector.extend((x / scale, y / scale, z / scale))
+            nx, ny, nz = x / scale, y / scale, z / scale
+            normalized_points.append((nx, ny, nz))
+            vector.extend((nx, ny, nz))
+
+        # Refuerzo geométrico: pequeñas variaciones de ubicación de un landmark
+        # afectan menos cuando la flexión real del dedo coincide con el modelo.
+        vector.extend(_descriptor_flexion_dedos(normalized_points))
 
         handedness = str(hand.get("handedness", "Unknown")) if isinstance(hand, dict) else "Unknown"
         handedness_order = 0 if handedness == "Left" else 1 if handedness == "Right" else 2
@@ -659,6 +788,115 @@ def _energia_movimiento(sequence):
         total += (squared / len(actual)) ** 0.5
         pares += 1
     return total / max(1, pares)
+
+
+def _distancia_dtw_secuencia(sequence_a, sequence_b, band=DYNAMIC_DTW_BAND):
+    """
+    Distancia DTW limitada para dos secuencias de landmarks ya normalizadas.
+
+    La banda de Sakoe-Chiba evita alineaciones temporales absurdas y mantiene
+    el coste pequeño. Devuelve una distancia en una escala parecida al RMS
+    usado antes, para conservar los umbrales dinámicos existentes.
+    """
+    try:
+        a = np.asarray(sequence_a, dtype=np.float32)
+        b = np.asarray(sequence_b, dtype=np.float32)
+    except Exception:
+        return float("inf")
+
+    if (
+        a.ndim != 2
+        or b.ndim != 2
+        or a.shape[0] == 0
+        or b.shape[0] == 0
+        or a.shape[1] != b.shape[1]
+    ):
+        return float("inf")
+
+    n = int(a.shape[0])
+    m = int(b.shape[0])
+    band = max(abs(n - m), int(band or 0))
+
+    previous = np.full(m + 1, np.inf, dtype=np.float32)
+    previous[0] = 0.0
+
+    for i in range(1, n + 1):
+        current = np.full(m + 1, np.inf, dtype=np.float32)
+        j_start = max(1, i - band)
+        j_end = min(m, i + band)
+        if j_start > j_end:
+            return float("inf")
+
+        # Calculamos de golpe las distancias locales de esta fila. El pequeño
+        # bucle restante solo resuelve la ruta temporal del DTW.
+        row = b[j_start - 1:j_end]
+        diff = row - a[i - 1]
+        local_costs = np.sqrt(np.mean(diff * diff, axis=1))
+
+        for offset, j in enumerate(range(j_start, j_end + 1)):
+            best_previous = min(
+                float(previous[j]),
+                float(current[j - 1]),
+                float(previous[j - 1]),
+            )
+            current[j] = float(local_costs[offset]) + best_previous
+
+        previous = current
+
+    total_cost = float(previous[m])
+    if not np.isfinite(total_cost):
+        return float("inf")
+
+    # Las secuencias actuales se remuestrean normalmente a 16 pasos. Dividir
+    # por la longitud mayor mantiene la magnitud comparable con el RMS previo.
+    return total_cost / float(max(n, m))
+
+
+def _preseleccionar_candidatos_dtw(distances, labels, valid_mask=None):
+    """
+    Conserva los mejores candidatos del filtro RMS antes de ejecutar DTW.
+
+    Intenta mantener al menos el mejor candidato de cada etiqueta y después
+    añade segundas muestras por clase hasta el límite global.
+    """
+    if distances is None or labels is None:
+        return []
+
+    total = min(len(distances), len(labels))
+    if total <= 0:
+        return []
+
+    if valid_mask is None or len(valid_mask) != total:
+        valid_mask = np.ones(total, dtype=np.bool_)
+
+    per_label = {}
+    for i in range(total):
+        if not bool(valid_mask[i]):
+            continue
+        distance = float(distances[i])
+        if not np.isfinite(distance):
+            continue
+        per_label.setdefault(labels[i], []).append((distance, i))
+
+    if not per_label:
+        return []
+
+    selected = []
+    extras = []
+    for candidates in per_label.values():
+        candidates.sort(key=lambda item: item[0])
+        selected.append(candidates[0])
+        extras.extend(candidates[1:max(1, DYNAMIC_DTW_CANDIDATES_PER_LABEL)])
+
+    selected.sort(key=lambda item: item[0])
+    max_candidates = max(1, int(DYNAMIC_DTW_MAX_CANDIDATES))
+    if len(selected) >= max_candidates:
+        return [i for _, i in selected[:max_candidates]]
+
+    extras.sort(key=lambda item: item[0])
+    selected.extend(extras[:max_candidates - len(selected)])
+    selected.sort(key=lambda item: item[0])
+    return [i for _, i in selected]
 
 
 def _vectorizar_secuencia_movimiento(frames, target_steps=DYNAMIC_SEQUENCE_STEPS):
@@ -805,15 +1043,16 @@ def _preparar_muestras_reconocimiento(data):
 
 
 def reconocer_sena_dinamica(frames):
-    """Reconoce trayectorias comparando ventanas recientes con secuencias entrenadas."""
-    dynamic_samples = [
-        sample for sample in recognition_model_samples
-        if isinstance(sample, dict) and sample.get("kind") == "dynamic"
-    ]
-    if not dynamic_samples or not frames:
+    """
+    Reconoce movimiento con prefiltrado RMS + DTW temporal limitado.
+
+    El RMS conserva la velocidad del reconocedor original para descartar la
+    mayoría de muestras. DTW solo compara los candidatos más prometedores y
+    tolera que una misma seña se ejecute un poco más rápido o más lento.
+    """
+    if not recognition_dynamic_index or not frames:
         return None, 0.0
 
-    # Probamos varias longitudes recientes para tolerar distintas velocidades.
     total_frames = len(frames)
     candidate_lengths = []
     for length in (12, 18, 24, 32, total_frames):
@@ -821,75 +1060,119 @@ def reconocer_sena_dinamica(frames):
         if length >= DYNAMIC_MIN_FRAMES and length not in candidate_lengths:
             candidate_lengths.append(length)
 
+    frames_list = list(frames)
     best_by_label = {}
+
     for length in candidate_lengths:
-        feature = _vectorizar_secuencia_movimiento(list(frames)[-length:])
+        recent = frames_list[-length:]
+        feature = _vectorizar_secuencia_movimiento(recent)
         if feature is None or feature["motion"] < DYNAMIC_MIN_MOTION:
             continue
 
-        current_sequence = feature["sequence"]
-        current_motion = feature["motion"]
-        current_face_sequence = _vectorizar_secuencia_facial(list(frames)[-length:])
+        try:
+            current_sequence = np.asarray(feature["sequence"], dtype=np.float32)
+        except Exception:
+            continue
+        if current_sequence.ndim != 2:
+            continue
 
-        for sample in dynamic_samples:
-            if sample.get("hand_count") != feature["hand_count"]:
-                continue
-            reference_sequence = sample.get("sequence") or []
-            if len(reference_sequence) != len(current_sequence):
-                continue
+        key = (
+            int(feature["hand_count"]),
+            int(current_sequence.shape[0]),
+            int(current_sequence.shape[1]),
+        )
+        index = recognition_dynamic_index.get(key)
+        if not index:
+            continue
 
-            squared = 0.0
-            dims = 0
-            for current_frame, reference_frame in zip(current_sequence, reference_sequence):
-                if len(current_frame) != len(reference_frame):
-                    squared = None
-                    break
-                for a, b in zip(current_frame, reference_frame):
-                    diff = a - b
-                    squared += diff * diff
-                    dims += 1
-            if squared is None or dims == 0:
-                continue
+        references = index["sequences"]
 
-            distance = (squared / dims) ** 0.5
+        # Etapa 1: filtro rápido original, completamente vectorizado.
+        diff = references - current_sequence[None, :, :]
+        rms_distances = np.sqrt(np.mean(diff * diff, axis=(1, 2))).astype(np.float32)
 
-            # Penaliza secuencias con una cantidad de movimiento muy diferente.
-            reference_motion = max(1e-6, float(sample.get("motion", 0.0)))
-            motion_ratio = min(current_motion, reference_motion) / max(current_motion, reference_motion)
-            adjusted_distance = distance + (1.0 - motion_ratio) * 0.12
+        current_motion = max(1e-6, float(feature["motion"]))
+        reference_motion = np.maximum(index["motions"], 1e-6)
+        motion_ratio = (
+            np.minimum(current_motion, reference_motion)
+            / np.maximum(current_motion, reference_motion)
+        )
+        motion_penalty = (1.0 - motion_ratio) * 0.12
+        prefilter_distances = rms_distances + motion_penalty
 
-            # La cara es complementaria: solo participa si ESA muestra fue
-            # entrenada con rostro y el rostro actual está disponible.
-            reference_face_sequence = sample.get("face_sequence")
-            if current_face_sequence and reference_face_sequence:
-                if len(current_face_sequence) == len(reference_face_sequence):
-                    face_squared = 0.0
-                    face_dims = 0
-                    face_valid = True
-                    for current_face, reference_face in zip(
-                        current_face_sequence, reference_face_sequence
-                    ):
-                        if len(current_face) != len(reference_face):
-                            face_valid = False
-                            break
-                        for a, b in zip(current_face, reference_face):
-                            diff = a - b
-                            face_squared += diff * diff
-                            face_dims += 1
-                    if face_valid and face_dims:
-                        face_distance = (face_squared / face_dims) ** 0.5
-                        face_normalized = min(1.5, face_distance / FACE_MAX_DISTANCE)
-                        hand_normalized = min(1.5, adjusted_distance / DYNAMIC_MAX_DISTANCE)
-                        combined = (
-                            hand_normalized * (1.0 - FACE_DYNAMIC_WEIGHT)
-                            + face_normalized * FACE_DYNAMIC_WEIGHT
-                        )
-                        adjusted_distance = combined * DYNAMIC_MAX_DISTANCE
+        # La cara conserva exactamente su papel anterior. Si una muestra exige
+        # cara y no hay una lectura facial válida, ni siquiera entra al DTW.
+        current_face_sequence = _vectorizar_secuencia_facial(recent)
+        current_face = None
+        if current_face_sequence:
+            try:
+                current_face = np.asarray(current_face_sequence, dtype=np.float32)
+            except Exception:
+                current_face = None
 
-            label = sample["label"]
+        face_required = index.get("face_required")
+        if face_required is None or len(face_required) != len(prefilter_distances):
+            face_required = np.zeros(len(prefilter_distances), dtype=np.bool_)
+
+        valid_mask = np.ones(len(prefilter_distances), dtype=np.bool_)
+        if current_face is None or current_face.ndim != 2:
+            valid_mask[face_required] = False
+
+        if DYNAMIC_DTW_ENABLED:
+            selected_indices = _preseleccionar_candidatos_dtw(
+                prefilter_distances,
+                index["labels"],
+                valid_mask=valid_mask,
+            )
+        else:
+            selected_indices = [
+                i for i in range(len(prefilter_distances))
+                if bool(valid_mask[i]) and np.isfinite(prefilter_distances[i])
+            ]
+
+        if not selected_indices:
+            continue
+
+        # Etapa 2: DTW solo para la preselección. Mezclamos una pequeña parte
+        # del RMS original para evitar que una ruta temporal demasiado flexible
+        # convierta dos trayectorias distintas en una coincidencia artificial.
+        for i in selected_indices:
+            if DYNAMIC_DTW_ENABLED:
+                dtw_distance = _distancia_dtw_secuencia(
+                    current_sequence,
+                    references[i],
+                    band=DYNAMIC_DTW_BAND,
+                )
+                if not np.isfinite(dtw_distance):
+                    continue
+                hand_distance = (
+                    float(dtw_distance) * DYNAMIC_DTW_BLEND
+                    + float(rms_distances[i]) * (1.0 - DYNAMIC_DTW_BLEND)
+                    + float(motion_penalty[i])
+                )
+            else:
+                hand_distance = float(prefilter_distances[i])
+
+            reference_face = index["face_sequences"][i]
+            if reference_face is not None:
+                if current_face is None or current_face.ndim != 2:
+                    continue
+                if reference_face.shape != current_face.shape:
+                    continue
+                face_diff = current_face - reference_face
+                face_distance = float(np.sqrt(np.mean(face_diff * face_diff)))
+                face_normalized = min(1.5, face_distance / FACE_MAX_DISTANCE)
+                hand_normalized = min(1.5, hand_distance / DYNAMIC_MAX_DISTANCE)
+                combined = (
+                    hand_normalized * (1.0 - FACE_DYNAMIC_WEIGHT)
+                    + face_normalized * FACE_DYNAMIC_WEIGHT
+                )
+                hand_distance = combined * DYNAMIC_MAX_DISTANCE
+
+            label = index["labels"][i]
             previous = best_by_label.get(label)
-            if previous is None or adjusted_distance < previous:
-                best_by_label[label] = adjusted_distance
+            if previous is None or hand_distance < previous:
+                best_by_label[label] = hand_distance
 
     if not best_by_label:
         return None, 0.0
@@ -899,13 +1182,17 @@ def reconocer_sena_dinamica(frames):
     second_distance = ordered[1][0] if len(ordered) > 1 else DYNAMIC_MAX_DISTANCE
 
     similarity = max(0.0, min(1.0, 1.0 - nearest_distance / DYNAMIC_MAX_DISTANCE))
-    separation = max(0.0, min(1.0, (second_distance - nearest_distance) / max(0.10, second_distance)))
+    separation = max(
+        0.0,
+        min(1.0, (second_distance - nearest_distance) / max(0.10, second_distance)),
+    )
     confidence = (similarity * 0.82 + separation * 0.18) * 100.0
 
     if nearest_distance > DYNAMIC_MAX_DISTANCE or confidence < 58.0:
         return None, confidence
 
     return winner, min(99.0, confidence)
+
 
 def _sanitizar_nombre_modelo(nombre):
     """Convierte el nombre visible de una seña en un nombre de archivo seguro."""
@@ -924,10 +1211,146 @@ def _ruta_modelo_local(nombre):
     return LOCAL_TRAINED_MODELS_DIR / f"{_sanitizar_nombre_modelo(nombre)}.json"
 
 
+def _construir_indices_reconocimiento():
+    """Prepara matrices NumPy para que reconocer no recorra cada coordenada en Python."""
+    global recognition_static_index, recognition_dynamic_index
+
+    static_groups = {}
+    dynamic_groups = {}
+
+    for sample in recognition_model_samples:
+        if not isinstance(sample, dict):
+            continue
+
+        kind = sample.get("kind", "static")
+        hand_count = int(sample.get("hand_count", 0) or 0)
+        label = str(sample.get("label", "")).strip()
+        if hand_count <= 0 or not label:
+            continue
+
+        if kind == "static":
+            vector = sample.get("vector") or []
+            if not vector:
+                continue
+            try:
+                arr = np.asarray(vector, dtype=np.float32)
+            except Exception:
+                continue
+            if arr.ndim != 1 or arr.size == 0:
+                continue
+            key = (hand_count, int(arr.size))
+            group = static_groups.setdefault(key, {
+                "vectors": [],
+                "labels": [],
+                "face_vectors": [],
+                "face_required": [],
+            })
+            group["vectors"].append(arr)
+            group["labels"].append(label)
+            face_vector = sample.get("face_vector")
+            if face_vector:
+                try:
+                    face_arr = np.asarray(face_vector, dtype=np.float32)
+                    if face_arr.ndim != 1 or face_arr.size == 0:
+                        face_arr = None
+                except Exception:
+                    face_arr = None
+            else:
+                face_arr = None
+            group["face_vectors"].append(face_arr)
+            group["face_required"].append(face_arr is not None)
+
+        elif kind == "dynamic":
+            sequence = sample.get("sequence") or []
+            if not sequence:
+                continue
+            try:
+                arr = np.asarray(sequence, dtype=np.float32)
+            except Exception:
+                continue
+            if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] == 0:
+                continue
+            key = (hand_count, int(arr.shape[0]), int(arr.shape[1]))
+            group = dynamic_groups.setdefault(key, {
+                "sequences": [],
+                "labels": [],
+                "motions": [],
+                "face_sequences": [],
+                "face_required": [],
+            })
+            group["sequences"].append(arr)
+            group["labels"].append(label)
+            group["motions"].append(float(sample.get("motion", 0.0) or 0.0))
+
+            face_sequence = sample.get("face_sequence")
+            if face_sequence:
+                try:
+                    face_arr = np.asarray(face_sequence, dtype=np.float32)
+                    if face_arr.ndim != 2 or face_arr.shape[0] != arr.shape[0]:
+                        face_arr = None
+                except Exception:
+                    face_arr = None
+            else:
+                face_arr = None
+            group["face_sequences"].append(face_arr)
+            group["face_required"].append(face_arr is not None)
+
+    recognition_static_index = {}
+    for key, group in static_groups.items():
+        if not group["vectors"]:
+            continue
+        labels_tuple = tuple(group["labels"])
+        unique_labels = tuple(dict.fromkeys(labels_tuple))
+        label_to_id = {label: i for i, label in enumerate(unique_labels)}
+        label_ids = np.fromiter(
+            (label_to_id[label] for label in labels_tuple),
+            dtype=np.int32,
+            count=len(labels_tuple),
+        )
+
+        # Si los vectores faciales tienen una dimensión uniforme, también se
+        # dejan preparados como matriz NumPy para no recorrerlos uno por uno.
+        face_vectors_tuple = tuple(group["face_vectors"])
+        valid_face_vectors = [v for v in face_vectors_tuple if v is not None]
+        face_matrix = None
+        if valid_face_vectors:
+            face_sizes = {int(v.size) for v in valid_face_vectors}
+            if len(face_sizes) == 1:
+                face_size = next(iter(face_sizes))
+                face_matrix = np.zeros((len(face_vectors_tuple), face_size), dtype=np.float32)
+                for i, vector in enumerate(face_vectors_tuple):
+                    if vector is not None and int(vector.size) == face_size:
+                        face_matrix[i] = vector
+
+        recognition_static_index[key] = {
+            "vectors": np.stack(group["vectors"], axis=0),
+            "labels": labels_tuple,
+            "unique_labels": unique_labels,
+            "label_to_id": label_to_id,
+            "label_ids": label_ids,
+            "face_vectors": face_vectors_tuple,
+            "face_matrix": face_matrix,
+            "face_required": np.asarray(group["face_required"], dtype=np.bool_),
+        }
+
+    recognition_dynamic_index = {}
+    for key, group in dynamic_groups.items():
+        if not group["sequences"]:
+            continue
+        recognition_dynamic_index[key] = {
+            "sequences": np.stack(group["sequences"], axis=0),
+            "labels": tuple(group["labels"]),
+            "motions": np.asarray(group["motions"], dtype=np.float32),
+            "face_sequences": tuple(group["face_sequences"]),
+            "face_required": np.asarray(group["face_required"], dtype=np.bool_),
+        }
+
+
 def _reconstruir_muestras_reconocimiento():
-    """Une modelos externos + modelos locales sin tocar el hilo de cámara."""
+    """Une modelos externos + locales y deja índices rápidos preparados en RAM."""
     global recognition_model_samples
     recognition_model_samples = list(recognition_external_samples) + list(recognition_local_samples)
+    _construir_indices_reconocimiento()
     return recognition_model_samples
 
 
@@ -1173,11 +1596,16 @@ def sincronizar_modelos_servidor():
         return
 
     model_sync_in_progress = True
-    actualizar_barra_modelos("connecting", 0, "Conectando con PythonAnywhere...")
+    actualizar_barra_modelos("connecting", 2, "Preparando modelos locales...")
 
     def activar_en_ram(data, version=None, origen="servidor", mostrar_barra=True,
                        archivos_validos=None, muestras_servidor=None):
         global recognition_enabled
+
+        # El usuario puede desmarcar la opción mientras una descarga está en curso.
+        # En ese caso no activamos en RAM ningún modelo procedente del servidor.
+        if not SERVER_MODEL_SYNC_ENABLED:
+            return False
 
         ok = _activar_modelo_online(
             data,
@@ -1259,28 +1687,132 @@ def sincronizar_modelos_servidor():
         if MODEL_CACHE_FILE.exists():
             try:
                 datos_cache = _leer_json_modelo(MODEL_CACHE_FILE)
-                preparados_cache = _preparar_muestras_reconocimiento(datos_cache)
-                if preparados_cache:
-                    manifest_cache = _leer_manifest_local_modelo()
-                    version_cache = (
-                        str(manifest_cache.get("version", "")).strip() or None
-                    )
-                    modelo_activo = activar_en_ram(
-                        datos_cache,
-                        version=version_cache,
-                        origen="caché local",
-                        mostrar_barra=False,
+                manifest_cache = _leer_manifest_local_modelo()
+                version_cache = (
+                    str(manifest_cache.get("version", "")).strip() or None
+                )
+                # _activar_modelo_online ya valida/prepara el JSON. Evitamos
+                # recorrer todas las muestras dos veces durante el arranque.
+                modelo_activo = activar_en_ram(
+                    datos_cache,
+                    version=version_cache,
+                    origen="caché local",
+                    mostrar_barra=False,
+                )
+                if modelo_activo:
+                    actualizar_barra_modelos(
+                        "connecting",
+                        12,
+                        "Modelos locales listos · comprobando servidor...",
                     )
             except Exception as exc:
                 print(f"[MODELOS] Caché local inválida: {exc}")
 
         # ------------------------------------------------------
-        # 2) CONEXIÓN REAL CON PYTHONANYWHERE
+        # 2) COMPROBACIÓN RÁPIDA DE /api/status
+        # ------------------------------------------------------
+        # Si ya existe una caché válida, primero consultamos el endpoint pequeño
+        # /api/status. Si versión + cantidad coinciden, NO descargamos /api/modelos
+        # otra vez. Esto hace que el splash desaparezca casi inmediatamente.
+        if modelo_activo and MODEL_CACHE_FILE.exists():
+            try:
+                actualizar_barra_modelos(
+                    "connecting",
+                    18,
+                    "Comprobando modelos en PythonAnywhere...",
+                )
+
+                request_status = urllib.request.Request(
+                    SERVER_STATUS_URL,
+                    headers={
+                        "User-Agent": f"ManosQueHablan/{APP_VERSION}",
+                        "Accept": "application/json",
+                        "Cache-Control": "no-cache",
+                    },
+                )
+
+                with urllib.request.urlopen(
+                    request_status,
+                    timeout=min(2.5, SERVER_MODEL_STATUS_TIMEOUT),
+                ) as response:
+                    status_http = getattr(response, "status", None) or response.getcode()
+                    if int(status_http) != 200:
+                        raise ValueError(f"Servidor respondió HTTP {status_http}")
+                    status_raw = response.read()
+
+                status_payload = json.loads(status_raw.decode("utf-8"))
+                if not isinstance(status_payload, dict):
+                    raise ValueError("/api/status devolvió una respuesta inválida")
+                if str(status_payload.get("status", "")).strip().lower() != "online":
+                    raise ValueError("PythonAnywhere no está disponible")
+
+                version_remota_status = str(
+                    status_payload.get("model_version") or ""
+                ).strip()
+                try:
+                    cantidad_remota_status = int(status_payload.get("models", 0))
+                except (TypeError, ValueError):
+                    cantidad_remota_status = 0
+
+                manifest_local = _leer_manifest_local_modelo()
+                version_local_status = str(
+                    manifest_local.get("version") or ""
+                ).strip()
+                archivos_locales_status = manifest_local.get("files", [])
+                cantidad_local_status = (
+                    len(archivos_locales_status)
+                    if isinstance(archivos_locales_status, list)
+                    else 0
+                )
+
+                # Solo damos por idénticos los modelos si tenemos una versión
+                # explícita en ambos lados y también coincide la cantidad.
+                modelos_iguales = (
+                    bool(version_remota_status)
+                    and bool(version_local_status)
+                    and version_remota_status == version_local_status
+                    and cantidad_remota_status > 0
+                    and cantidad_remota_status == cantidad_local_status
+                )
+
+                if modelos_iguales:
+                    labels = sorted({
+                        item.get("label")
+                        for item in recognition_model_samples
+                        if isinstance(item, dict) and item.get("label")
+                    })
+                    actualizar_barra_modelos(
+                        "ready",
+                        100,
+                        f"✓ Modelos al día · {len(labels)} señas listas en RAM",
+                    )
+                    return
+
+                actualizar_barra_modelos(
+                    "connected",
+                    30,
+                    "Hay cambios en los modelos · preparando descarga...",
+                )
+
+            except Exception as exc:
+                # Si la comprobación rápida falla pero la caché ya está validada,
+                # no hacemos esperar al usuario otros 20 s. Entramos con la caché
+                # y el comprobador automático volverá a consultar más adelante.
+                print(f"[MODELOS] Comprobación rápida omitida: {exc}")
+                actualizar_barra_modelos(
+                    "offline",
+                    100,
+                    "⚠ Servidor lento/sin conexión · usando modelos locales listos",
+                )
+                return
+
+        # ------------------------------------------------------
+        # 3) DESCARGA REAL DESDE PYTHONANYWHERE (solo si hace falta)
         # ------------------------------------------------------
         try:
             actualizar_barra_modelos(
                 "connecting",
-                2,
+                18,
                 "Conectando con PythonAnywhere...",
             )
 
@@ -1303,7 +1835,7 @@ def sincronizar_modelos_servidor():
 
                 actualizar_barra_modelos(
                     "connected",
-                    8,
+                    30,
                     "✓ Servidor conectado correctamente · iniciando descarga...",
                 )
 
@@ -1320,7 +1852,7 @@ def sincronizar_modelos_servidor():
                 if total > 0:
                     actualizar_barra_modelos(
                         "downloading",
-                        8,
+                        30,
                         "Descargando modelos... 0%",
                     )
                 else:
@@ -1339,9 +1871,12 @@ def sincronizar_modelos_servidor():
                     recibidos += len(chunk)
 
                     if total > 0:
-                        # La descarga ocupa visualmente del 8% al 82%.
+                        # La descarga ocupa visualmente del 30% al 82%.
+                        # El porcentaje del texto sigue siendo el porcentaje REAL
+                        # de bytes descargados; la barra reserva el tramo final
+                        # para validación y carga en RAM.
                         descarga_pct = min(100.0, recibidos * 100.0 / total)
-                        barra_pct = 8.0 + (descarga_pct * 0.74)
+                        barra_pct = 30.0 + (descarga_pct * 0.52)
                         porcentaje_entero = int(descarga_pct)
                         if porcentaje_entero != ultimo_porcentaje:
                             ultimo_porcentaje = porcentaje_entero
@@ -1357,7 +1892,7 @@ def sincronizar_modelos_servidor():
                 raise ValueError("El servidor devolvió una descarga vacía")
 
             # ------------------------------------------------------
-            # 3) VALIDACIÓN REAL DEL JSON Y DE LOS ARCHIVOS
+            # 4) VALIDACIÓN REAL DEL JSON Y DE LOS ARCHIVOS
             # ------------------------------------------------------
             actualizar_barra_modelos(
                 "verifying",
@@ -1455,7 +1990,7 @@ def sincronizar_modelos_servidor():
             )
 
             # ------------------------------------------------------
-            # 4) GUARDAR CACHÉ VALIDADA Y CARGAR EN RAM
+            # 5) GUARDAR CACHÉ VALIDADA Y CARGAR EN RAM
             # ------------------------------------------------------
             actualizar_barra_modelos(
                 "processing",
@@ -1558,79 +2093,304 @@ def sincronizar_modelos_servidor():
         name="ServerModelSync",
     ).start()
 
+
+
+def comprobar_actualizaciones_modelos_automaticamente():
+    """Revisa PythonAnywhere sin bloquear la cámara y sincroniza solo si cambió algo."""
+    global model_auto_update_check_in_progress
+    global model_auto_update_last_signature
+
+    # Esta función es invocada por root.after desde el hilo principal.
+    # Programamos primero la próxima revisión para que continúe durante toda la sesión.
+    if SERVER_MODEL_AUTO_UPDATE_ENABLED:
+        try:
+            root.after(
+                max(5000, int(SERVER_MODEL_AUTO_UPDATE_INTERVAL * 1000)),
+                comprobar_actualizaciones_modelos_automaticamente,
+            )
+        except Exception:
+            return
+    else:
+        return
+
+    # Si el usuario desactiva “Utilizar modelos del servidor”, el temporizador
+    # sigue vivo pero NO hace ninguna consulta de red. Al volver a marcarlo,
+    # las comprobaciones automáticas se reanudan sin crear temporizadores dobles.
+    if not SERVER_MODEL_SYNC_ENABLED:
+        return
+
+    if model_auto_update_check_in_progress or model_sync_in_progress:
+        return
+
+    model_auto_update_check_in_progress = True
+
+    def worker():
+        global model_auto_update_check_in_progress
+        global model_auto_update_last_signature
+
+        try:
+            request_status = urllib.request.Request(
+                SERVER_STATUS_URL,
+                headers={
+                    "User-Agent": f"ManosQueHablan/{APP_VERSION}",
+                    "Accept": "application/json",
+                    "Cache-Control": "no-cache",
+                },
+            )
+
+            with urllib.request.urlopen(
+                request_status,
+                timeout=SERVER_MODEL_STATUS_TIMEOUT,
+            ) as response:
+                status_http = getattr(response, "status", None) or response.getcode()
+                if int(status_http) != 200:
+                    return
+                raw = response.read()
+
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                return
+            if str(payload.get("status", "")).strip().lower() != "online":
+                return
+
+            version_remota = str(payload.get("model_version") or "").strip()
+            try:
+                cantidad_remota = int(payload.get("models", 0))
+            except (TypeError, ValueError):
+                cantidad_remota = 0
+
+            if cantidad_remota <= 0:
+                return
+
+            firma_remota = (version_remota, cantidad_remota)
+
+            # La primera firma se compara con el manifest que dejó la descarga inicial.
+            manifest_local = _leer_manifest_local_modelo()
+            version_local = str(manifest_local.get("version") or "").strip()
+            archivos_locales = manifest_local.get("files", [])
+            cantidad_local = (
+                len(archivos_locales)
+                if isinstance(archivos_locales, list)
+                else 0
+            )
+            firma_local = (version_local, cantidad_local)
+
+            if model_auto_update_last_signature is None:
+                model_auto_update_last_signature = firma_local
+
+            # Detecta automáticamente si se AÑADIERON o ELIMINARON modelos,
+            # o si cambió model_version manteniendo la misma cantidad.
+            if firma_remota != firma_local:
+                print(
+                    "[MODELOS] Actualización automática detectada: "
+                    f"local={firma_local}, servidor={firma_remota}"
+                )
+
+                diferencia = cantidad_remota - cantidad_local
+                if diferencia > 0:
+                    texto_cambio = (
+                        f"+ {diferencia} modelo(s) nuevo(s) detectado(s) · "
+                        "actualizando automáticamente..."
+                    )
+                elif diferencia < 0:
+                    texto_cambio = (
+                        f"− {abs(diferencia)} modelo(s) eliminado(s) detectado(s) · "
+                        "actualizando automáticamente..."
+                    )
+                else:
+                    texto_cambio = (
+                        "↻ Cambio en los modelos detectado · "
+                        "actualizando automáticamente..."
+                    )
+
+                model_auto_update_last_signature = firma_remota
+                actualizar_barra_modelos(
+                    "connected",
+                    5,
+                    texto_cambio,
+                )
+                sincronizar_modelos_servidor()
+            else:
+                model_auto_update_last_signature = firma_remota
+
+        except Exception as exc:
+            # Una revisión automática fallida no cambia los modelos que ya están en RAM
+            # ni ensucia la barra con errores. Se vuelve a intentar en el siguiente ciclo.
+            print(f"[MODELOS] Revisión automática omitida: {exc}")
+        finally:
+            model_auto_update_check_in_progress = False
+
+    threading.Thread(
+        target=worker,
+        daemon=True,
+        name="ServerModelAutoUpdateCheck",
+    ).start()
+
 def reconocer_sena(hands_data, face_data=None):
-    """Reconoce manos y usa la cara solo en modelos entrenados con ella."""
-    model_samples = recognition_model_samples
-    if not model_samples:
+    """Reconoce poses estáticas usando matrices ya preparadas en RAM."""
+    if not recognition_model_samples:
         return None, 0.0
 
     feature = _vector_reconocimiento(hands_data)
     if feature is None:
         return None, 0.0
 
-    current = feature["vector"]
-    hand_count = feature["hand_count"]
+    try:
+        current = np.asarray(feature["vector"], dtype=np.float32)
+    except Exception:
+        return None, 0.0
+
+    hand_count = int(feature["hand_count"])
+    key = (hand_count, int(current.size))
+    index = recognition_static_index.get(key)
+    if not index:
+        return None, 0.0
+
+    references = index["vectors"]
+    if references.size == 0:
+        return None, 0.0
+
+    # Una sola operación NumPy compara el frame actual contra TODAS las muestras.
+    diff = references - current[None, :]
+    # RMS euclidiano equivalente al cálculo anterior, usando einsum para
+    # evitar crear otra matriz temporal con diff * diff.
+    hand_distances = np.sqrt(
+        np.einsum("ij,ij->i", diff, diff) / max(1, current.size)
+    ).astype(np.float32, copy=False)
+    distances = hand_distances.copy()
+
     current_face_vector = _vector_facial_desde_dato(face_data)
-    distances = []
+    current_face = None
+    if current_face_vector is not None:
+        try:
+            current_face = np.asarray(current_face_vector, dtype=np.float32)
+        except Exception:
+            current_face = None
 
-    for sample in model_samples:
-        if sample.get("kind", "static") != "static":
-            continue
-        if sample["hand_count"] != hand_count:
-            continue
+    # Una muestra entrenada CON rostro no se degrada silenciosamente a "solo
+    # manos" si la cara no está disponible. Así una seña facial no se dispara
+    # por tener una postura manual parecida a otra.
+    face_required = index.get("face_required")
+    if face_required is None or len(face_required) != len(distances):
+        face_required = np.zeros(len(distances), dtype=np.bool_)
 
-        reference = sample["vector"]
-        if len(reference) != len(current):
-            continue
-
-        # Distancia RMS entre landmarks normalizados.
-        squared = 0.0
-        for a, b in zip(current, reference):
-            diff = a - b
-            squared += diff * diff
-        hand_distance = (squared / max(1, len(current))) ** 0.5
-        distance = hand_distance
-
-        reference_face_vector = sample.get("face_vector")
-        if current_face_vector is not None and reference_face_vector is not None:
-            face_distance = _distancia_vectorial(current_face_vector, reference_face_vector)
-            if face_distance is not None:
-                # Normalizamos las dos distancias antes de mezclarlas para que
-                # la cara ayude, pero nunca domine a las manos.
-                hand_normalized = min(1.5, hand_distance / 0.42)
+    if current_face is None:
+        distances[face_required] = np.inf
+    else:
+        face_matrix = index.get("face_matrix")
+        if (
+            face_matrix is not None
+            and face_matrix.ndim == 2
+            and face_matrix.shape[1] == current_face.size
+            and np.any(face_required)
+        ):
+            required_idx = np.flatnonzero(face_required)
+            face_diff = face_matrix[required_idx] - current_face[None, :]
+            face_distances = np.sqrt(
+                np.einsum("ij,ij->i", face_diff, face_diff) / max(1, current_face.size)
+            )
+            hand_normalized = np.minimum(
+                1.5, hand_distances[required_idx] / STATIC_MAX_DISTANCE
+            )
+            face_normalized = np.minimum(
+                1.5, face_distances / FACE_MAX_DISTANCE
+            )
+            distances[required_idx] = (
+                hand_normalized * (1.0 - FACE_STATIC_WEIGHT)
+                + face_normalized * FACE_STATIC_WEIGHT
+            ) * STATIC_MAX_DISTANCE
+        else:
+            # Compatibilidad defensiva para modelos faciales antiguos o de
+            # dimensiones distintas. Solo entra aquí en esos casos raros.
+            for i, reference_face in enumerate(index["face_vectors"]):
+                if reference_face is None:
+                    continue
+                if reference_face.shape != current_face.shape:
+                    distances[i] = np.inf
+                    continue
+                face_diff = current_face - reference_face
+                face_distance = float(np.sqrt(np.mean(face_diff * face_diff)))
+                hand_distance = float(hand_distances[i])
+                hand_normalized = min(1.5, hand_distance / STATIC_MAX_DISTANCE)
                 face_normalized = min(1.5, face_distance / FACE_MAX_DISTANCE)
                 combined = (
                     hand_normalized * (1.0 - FACE_STATIC_WEIGHT)
                     + face_normalized * FACE_STATIC_WEIGHT
                 )
-                distance = combined * 0.42
+                distances[i] = combined * STATIC_MAX_DISTANCE
 
-        distances.append((distance, sample["label"]))
-
-    if not distances:
+    finite_idx = np.flatnonzero(np.isfinite(distances))
+    total = int(finite_idx.size)
+    if total <= 0:
         return None, 0.0
 
-    distances.sort(key=lambda item: item[0])
-    nearest = distances[: min(5, len(distances))]
+    # KNN original, limitado a muestras válidas después del filtro facial.
+    k = min(5, total)
+    finite_distances = distances[finite_idx]
+    if total > k:
+        local_idx = np.argpartition(finite_distances, k - 1)[:k]
+        candidate_idx = finite_idx[local_idx]
+    else:
+        candidate_idx = finite_idx
 
+    labels = index["labels"]
     weights = {}
     total_weight = 0.0
-    for distance, label in nearest:
+    nearest_distance_by_label = {}
+
+    for idx in candidate_idx:
+        idx = int(idx)
+        distance = float(distances[idx])
+        label = labels[idx]
         weight = 1.0 / (distance + 1e-6)
         weights[label] = weights.get(label, 0.0) + weight
         total_weight += weight
+        previous = nearest_distance_by_label.get(label)
+        if previous is None or distance < previous:
+            nearest_distance_by_label[label] = distance
+
+    if not weights:
+        return None, 0.0
 
     winner = max(weights, key=weights.get)
-    winner_distances = [distance for distance, label in nearest if label == winner]
-    nearest_distance = min(winner_distances) if winner_distances else nearest[0][0]
+    nearest_distance = nearest_distance_by_label[winner]
     agreement = weights[winner] / total_weight if total_weight > 0 else 0.0
 
-    # La confianza combina cercanía geométrica y acuerdo entre vecinos.
     similarity = max(0.0, min(1.0, 1.0 - (nearest_distance / 0.55)))
     confidence = (similarity * 0.65 + agreement * 0.35) * 100.0
 
-    # Rechazamos poses demasiado alejadas para no inventar una traducción.
-    if nearest_distance > 0.42 or confidence < 50.0:
+    # Rival más cercano entre TODAS las muestras, pero sin bucle Python.
+    # np.minimum.at reduce cada clase a su menor distancia en una sola ruta NumPy.
+    label_ids = index.get("label_ids")
+    unique_labels = index.get("unique_labels")
+    label_to_id = index.get("label_to_id")
+    if (
+        label_ids is not None
+        and unique_labels
+        and label_to_id
+        and len(label_ids) == len(distances)
+    ):
+        best_by_class = np.full(len(unique_labels), np.inf, dtype=np.float32)
+        np.minimum.at(
+            best_by_class,
+            label_ids[finite_idx],
+            distances[finite_idx],
+        )
+        winner_id = label_to_id.get(winner)
+        if winner_id is not None and len(best_by_class) > 1:
+            winner_best = best_by_class[winner_id]
+            best_by_class[winner_id] = np.inf
+            second_distance = float(np.min(best_by_class))
+            best_by_class[winner_id] = winner_best
+            if np.isfinite(second_distance):
+                class_margin = second_distance - nearest_distance
+                if (
+                    class_margin < STATIC_MIN_CLASS_MARGIN
+                    and confidence < STATIC_AMBIGUITY_CONFIDENCE_OVERRIDE
+                ):
+                    return None, max(0.0, confidence - 6.0)
+
+    if nearest_distance > STATIC_MAX_DISTANCE or confidence < STATIC_MIN_CONFIDENCE:
         return None, confidence
 
     return winner, min(99.0, confidence)
@@ -1847,9 +2607,13 @@ def process_face_frames():
     last_run = 0.0
 
     while running:
-        # Si ningún modelo necesita cara, el usuario no la está entrenando y
-        # tampoco se pidió mostrar puntos, este hilo queda casi dormido.
-        if (not SHOW_FACE_POINTS) and (not face_training_requested) and (not _modelos_usan_cara()):
+        # En Turbo, Face Mesh NO consume CPU solo para dibujar puntos.
+        # Sigue activándose automáticamente cuando un modelo necesita rostro
+        # o cuando la ventana de entrenamiento lo solicita. Con Turbo apagado
+        # se conserva exactamente el comportamiento visual anterior.
+        face_required = bool(face_training_requested or _modelos_usan_cara())
+        face_visual_only = bool(SHOW_FACE_POINTS and not TURBO_MODE_ENABLED)
+        if not face_required and not face_visual_only:
             with lock:
                 latest_face_features = None
                 latest_face_frame_id = -1
@@ -1869,7 +2633,7 @@ def process_face_frames():
             if latest_frame is None or latest_frame_id == processed_id:
                 source = None
             else:
-                source = latest_frame.copy()
+                source = latest_frame
                 source_id = latest_frame_id
 
         if source is None:
@@ -1941,6 +2705,17 @@ def server_recognition_worker():
             connection = None
 
     while running:
+        # El traductor solo trabaja en su propia pestaña. Fuera de "Traducir"
+        # no enviamos landmarks al servidor ni conservamos resultados remotos.
+        if globals().get("sidebar_active") != "Traducir":
+            with lock:
+                server_recognized_sign = None
+                server_recognition_confidence = 0.0
+                server_result_time = 0.0
+            close_connection()
+            time.sleep(0.03)
+            continue
+
         now = time.perf_counter()
         remaining = SERVER_REQUEST_INTERVAL - (now - last_request_started)
 
@@ -2067,6 +2842,126 @@ def server_recognition_worker():
 # PROCESAMIENTO MEDIAPIPE EN HILO INDEPENDIENTE
 # ==========================================================
 
+def _reiniciar_candidato_cambio_reconocimiento():
+    global recognition_switch_candidate
+    global recognition_switch_count
+    global recognition_switch_time
+    recognition_switch_candidate = None
+    recognition_switch_count = 0
+    recognition_switch_time = 0.0
+
+
+def _reiniciar_filtro_entrada_estatica():
+    global static_entry_candidate
+    global static_entry_count
+    global static_entry_since
+    global static_entry_last_seen
+    global static_entry_approved
+    static_entry_candidate = None
+    static_entry_count = 0
+    static_entry_since = 0.0
+    static_entry_last_seen = 0.0
+    static_entry_approved = None
+
+
+def _permitir_entrada_estatica(raw_sign, now):
+    """Confirma una estática durante varios frames antes de mostrarla.
+
+    El filtro solo trabaja sobre la etiqueta ya calculada por el reconocedor.
+    No vuelve a ejecutar MediaPipe, no modifica landmarks ni cambia los JSON.
+    """
+    global static_entry_candidate
+    global static_entry_count
+    global static_entry_since
+    global static_entry_last_seen
+    global static_entry_approved
+
+    if not raw_sign:
+        _reiniciar_filtro_entrada_estatica()
+        return False
+
+    # Una estática que ya fue confirmada sigue pasando sin añadir demora mientras
+    # el reconocedor continúe devolviendo la misma etiqueta.
+    if raw_sign == static_entry_approved:
+        static_entry_last_seen = now
+        return True
+
+    expired = (
+        static_entry_last_seen <= 0.0
+        or (now - static_entry_last_seen) > STATIC_ENTRY_TIMEOUT_SECONDS
+    )
+
+    if raw_sign != static_entry_candidate or expired:
+        static_entry_candidate = raw_sign
+        static_entry_count = 1
+        static_entry_since = now
+        static_entry_last_seen = now
+        return False
+
+    static_entry_count += 1
+    static_entry_last_seen = now
+
+    if static_entry_count < STATIC_ENTRY_CONFIRMATIONS:
+        return False
+
+    if (now - static_entry_since) < STATIC_ENTRY_STABLE_SECONDS:
+        return False
+
+    static_entry_approved = raw_sign
+    static_entry_candidate = None
+    static_entry_count = 0
+    static_entry_since = 0.0
+    return True
+
+
+def _permitir_cambio_reconocimiento(raw_sign, raw_confidence, now):
+    """Evita cambiar de etiqueta por un solo frame sin retrasar la primera seña."""
+    global recognition_switch_candidate
+    global recognition_switch_count
+    global recognition_switch_time
+
+    if not raw_sign:
+        _reiniciar_candidato_cambio_reconocimiento()
+        return False
+
+    current_sign = recognition_display_sign
+    if not current_sign or raw_sign == current_sign:
+        _reiniciar_candidato_cambio_reconocimiento()
+        return True
+
+    try:
+        raw_confidence = float(raw_confidence or 0.0)
+    except (TypeError, ValueError):
+        raw_confidence = 0.0
+
+    # Si la nueva seña es clarísima y supera ampliamente a la actual, no la
+    # hacemos esperar a un segundo frame.
+    if (
+        raw_confidence >= RECOGNITION_SWITCH_FAST_CONFIDENCE
+        and raw_confidence >= recognition_display_confidence + RECOGNITION_SWITCH_FAST_MARGIN
+    ):
+        _reiniciar_candidato_cambio_reconocimiento()
+        return True
+
+    expired = (
+        recognition_switch_time <= 0.0
+        or (now - recognition_switch_time) > RECOGNITION_SWITCH_TIMEOUT_SECONDS
+    )
+    if raw_sign != recognition_switch_candidate or expired:
+        recognition_switch_candidate = raw_sign
+        recognition_switch_count = 1
+        recognition_switch_time = now
+        return False
+
+    recognition_switch_count += 1
+    recognition_switch_time = now
+    if recognition_switch_count >= RECOGNITION_SWITCH_CONFIRMATIONS:
+        _reiniciar_candidato_cambio_reconocimiento()
+        return True
+
+    return False
+
+
 def process_frames():
     global latest_processed_frame
     global latest_processed_frame_id
@@ -2093,7 +2988,9 @@ def process_frames():
             if latest_frame is None or latest_frame_id == processed_id:
                 frame = None
             else:
-                frame = latest_frame.copy()
+                # Referencia segura al frame más reciente: capture_frames() reemplaza
+                # el objeto completo y nunca modifica este ndarray en sitio.
+                frame = latest_frame
                 frame_id = latest_frame_id
                 capture_time = latest_frame_capture_time
 
@@ -2108,10 +3005,18 @@ def process_frames():
 
         original_height, original_width = frame.shape[:2]
 
-        # COPIA PEQUEÑA SOLO PARA MEDIAPIPE.
+        # Copia pequeña SOLO para MediaPipe. En Turbo reducimos únicamente
+        # la entrada EN VIVO; entrenamiento/importación conserva 640x360.
+        if TURBO_MODE_ENABLED:
+            live_process_width = TURBO_PROCESS_WIDTH
+            live_process_height = TURBO_PROCESS_HEIGHT
+        else:
+            live_process_width = PROCESS_WIDTH
+            live_process_height = PROCESS_HEIGHT
+
         small_frame = cv2.resize(
             frame,
-            (PROCESS_WIDTH, PROCESS_HEIGHT),
+            (live_process_width, live_process_height),
             interpolation=cv2.INTER_LINEAR
         )
 
@@ -2127,7 +3032,11 @@ def process_frames():
         rgb_small.flags.writeable = True
 
         hand_count = 0
+        # recognition_hands_data usa los landmarks CRUDOS del frame actual para
+        # responder sin la inercia del suavizado. training_hands_data conserva
+        # el comportamiento anterior para capturar/entrenar modelos.
         recognition_hands_data = []
+        training_hands_data = []
 
         if results.multi_hand_landmarks:
             hand_count = len(results.multi_hand_landmarks)
@@ -2155,13 +3064,23 @@ def process_frames():
                 hand_key = f"{hand_label}_{hand_index}"
                 current_hand_keys.add(hand_key)
 
+                # Reconocimiento: usa el frame ACTUAL, antes de suavizarlo.
+                recognition_hands_data.append({
+                    "handedness": hand_label,
+                    "landmarks": [
+                        {"x": float(lm.x), "y": float(lm.y), "z": float(lm.z)}
+                        for lm in hand_landmarks.landmark
+                    ],
+                })
+
+                # El suavizado queda solo para la visualización y para mantener
+                # compatible la captura de entrenamiento existente.
                 hand_landmarks = stabilize_hand_landmarks(
                     hand_landmarks,
                     hand_key
                 )
 
-                # Copia ligera de los 21 puntos para el modelo de reconocimiento.
-                recognition_hands_data.append({
+                training_hands_data.append({
                     "handedness": hand_label,
                     "landmarks": [
                         {"x": float(lm.x), "y": float(lm.y), "z": float(lm.z)}
@@ -2204,9 +3123,13 @@ def process_frames():
         # ------------------------------------------------------
         # RECONOCIMIENTO HÍBRIDO: manos + movimiento + cara opcional
         # ------------------------------------------------------
-        face_snapshot = _cara_actual_reciente()
+        # Cada pestaña es independiente: MediaPipe puede seguir entregando los
+        # landmarks para cámara/entrenamiento, pero la CLASIFICACIÓN de señas
+        # solo se ejecuta dentro de la pestaña "Traducir".
+        traductor_activo = globals().get("sidebar_active") == "Traducir"
+        face_snapshot = _cara_actual_reciente() if traductor_activo else None
 
-        if recognition_hands_data:
+        if traductor_activo and recognition_hands_data:
             dynamic_frame = {
                 "t": time.perf_counter(),
                 "hands": recognition_hands_data,
@@ -2217,15 +3140,22 @@ def process_frames():
         else:
             dynamic_recognition_buffer.clear()
             dynamic_last_result = (None, 0.0)
+            dynamic_recognition_tick = 0
 
         # ------------------------------------------------------
         # RECONOCIMIENTO HÍBRIDO: servidor primero + local de respaldo
         # ------------------------------------------------------
         local_sign = None
         local_confidence = 0.0
+        local_sign_is_dynamic = False
 
-        # El reconocimiento local original se conserva intacto como respaldo.
-        if recognition_enabled and recognition_hands_data and recognition_model_samples:
+        # El reconocimiento local solo corre en Señas a texto / Traducir.
+        if (
+            traductor_activo
+            and recognition_enabled
+            and recognition_hands_data
+            and recognition_model_samples
+        ):
             static_sign, static_confidence = reconocer_sena(
                 recognition_hands_data,
                 face_snapshot,
@@ -2241,9 +3171,11 @@ def process_frames():
             if dynamic_sign and dynamic_confidence >= max(62.0, static_confidence - 4.0):
                 local_sign = dynamic_sign
                 local_confidence = dynamic_confidence
+                local_sign_is_dynamic = True
             else:
                 local_sign = static_sign
                 local_confidence = static_confidence
+                local_sign_is_dynamic = False
 
         # Leer únicamente la última respuesta ya recibida. Aquí NO hay Internet,
         # por eso process_frames() nunca espera al servidor.
@@ -2253,7 +3185,8 @@ def process_frames():
             remote_time = server_result_time
 
         remote_is_recent = (
-            SERVER_RECOGNITION_ENABLED
+            traductor_activo
+            and SERVER_RECOGNITION_ENABLED
             and recognition_hands_data
             and remote_sign
             and remote_time > 0
@@ -2263,21 +3196,56 @@ def process_frames():
         if remote_is_recent:
             raw_recognized_sign = remote_sign
             raw_recognition_confidence = remote_confidence
+            # El endpoint remoto no informa si la etiqueta provino de una seña
+            # estática o dinámica. Se conserva su comportamiento original.
+            raw_sign_is_static_local = False
+            _reiniciar_filtro_entrada_estatica()
         else:
             raw_recognized_sign = local_sign
             raw_recognition_confidence = local_confidence
+            raw_sign_is_static_local = bool(local_sign and not local_sign_is_dynamic)
+
+        # Candado exclusivo de ESTÁTICAS locales. Una postura de transición debe
+        # permanecer unos frames antes de poder llegar al resto de la lógica.
+        # Las dinámicas pasan exactamente como antes.
+        static_filter_now = time.perf_counter()
+        if raw_sign_is_static_local:
+            if not _permitir_entrada_estatica(raw_recognized_sign, static_filter_now):
+                raw_recognized_sign = None
+        else:
+            _reiniciar_filtro_entrada_estatica()
 
         # Anti-parpadeo sin agregar demora a la primera deteccion.
-        # Si llega una seña valida, se muestra de inmediato. Si solo uno o dos
-        # resultados vienen vacios, conservamos la ultima seña por 220 ms.
+        # Fuera de Traducir limpiamos el resultado para que ninguna otra
+        # pestaña herede una seña ni active voz/historial por detrás.
         recognition_now = time.perf_counter()
 
-        if raw_recognized_sign:
-            recognition_display_sign = raw_recognized_sign
-            recognition_display_confidence = raw_recognition_confidence
+        # La primera seña entra al instante. Solo si YA había una etiqueta y
+        # aparece otra diferente se filtra un posible salto de un único frame.
+        filtered_raw_sign = raw_recognized_sign
+        filtered_raw_confidence = raw_recognition_confidence
+        if traductor_activo and raw_recognized_sign:
+            if not _permitir_cambio_reconocimiento(
+                raw_recognized_sign,
+                raw_recognition_confidence,
+                recognition_now,
+            ):
+                filtered_raw_sign = None
+        else:
+            _reiniciar_candidato_cambio_reconocimiento()
+
+        if not traductor_activo:
+            recognition_display_sign = None
+            recognition_display_confidence = 0.0
+            recognition_display_time = 0.0
+            recognized_sign = None
+            recognition_confidence = 0.0
+        elif filtered_raw_sign:
+            recognition_display_sign = filtered_raw_sign
+            recognition_display_confidence = filtered_raw_confidence
             recognition_display_time = recognition_now
-            recognized_sign = raw_recognized_sign
-            recognition_confidence = raw_recognition_confidence
+            recognized_sign = filtered_raw_sign
+            recognition_confidence = filtered_raw_confidence
         elif (
             recognition_display_sign
             and (recognition_now - recognition_display_time)
@@ -2329,7 +3297,7 @@ def process_frames():
             latest_processing_latency_ms = latency_ms
             latest_recognized_sign = recognized_sign
             latest_recognition_confidence = recognition_confidence
-            latest_recognition_hands_data = recognition_hands_data
+            latest_recognition_hands_data = training_hands_data
 
         processed_id = frame_id
 
@@ -2394,6 +3362,15 @@ def iniciar_camara():
 
     # Intentamos mantener el buffer al mínimo.
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    # En Turbo pedimos hasta 60 FPS. Es una solicitud al driver: si la webcam
+    # no lo soporta, OpenCV simplemente conserva la frecuencia disponible.
+    # No forzamos resolución ni códec para evitar romper cámaras/virtual cams.
+    if TURBO_MODE_ENABLED:
+        try:
+            cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
+        except Exception:
+            pass
 
     # NO fijamos CAP_PROP_FRAME_WIDTH ni CAP_PROP_FRAME_HEIGHT.
     # De esta forma no obligamos a la cámara a una resolución concreta.
@@ -2613,6 +3590,7 @@ def _aplicar_barra_modelos_en_tk(estado, progreso=None, detalle=None):
     if progreso is not None:
         model_sync_last_progress = progreso
 
+
     c = THEMES.get(current_theme_name, THEMES["Oscuro"])
     barra = model_sync_progress
     etiqueta = model_sync_label
@@ -2817,7 +3795,9 @@ def actualizar_video():
                 latest_processed_frame is not None
                 and latest_processed_frame_id != last_displayed_processed_id
             ):
-                frame = latest_processed_frame.copy()
+                # El hilo de procesamiento publica un frame terminado y después
+                # reemplaza la referencia; no vuelve a modificar este objeto.
+                frame = latest_processed_frame
                 processed_id = latest_processed_frame_id
                 hand_count = latest_hand_count
                 latency_ms = latest_processing_latency_ms
@@ -2890,10 +3870,10 @@ def actualizar_video():
                             translation_confidence_value.configure(
                                 text=f"{recognition_confidence:.0f}%"
                             )
-                        if "actualizar_oracion_detectada" in globals():
+                        if globals().get("sidebar_active") == "Traducir" and "actualizar_oracion_detectada" in globals():
                             actualizar_oracion_detectada(recognized_sign, confidence=recognition_confidence)
                     else:
-                        if "actualizar_oracion_detectada" in globals():
+                        if globals().get("sidebar_active") == "Traducir" and "actualizar_oracion_detectada" in globals():
                             actualizar_oracion_detectada(None)
                         if "translation_status_value" in globals():
                             translation_status_value.configure(
@@ -2913,7 +3893,7 @@ def actualizar_video():
                                 )
                             )
                 else:
-                    if "actualizar_oracion_detectada" in globals():
+                    if globals().get("sidebar_active") == "Traducir" and "actualizar_oracion_detectada" in globals():
                         actualizar_oracion_detectada(None)
                     if "translation_status_value" in globals():
                         translation_status_value.configure(
@@ -2946,7 +3926,7 @@ def actualizar_video():
                             text=f"{recognition_confidence:.0f}%"
                         )
                 else:
-                    if "actualizar_oracion_detectada" in globals():
+                    if globals().get("sidebar_active") == "Traducir" and "actualizar_oracion_detectada" in globals():
                         actualizar_oracion_detectada(None, sin_manos=True)
 
                     if "translation_status_value" in globals():
@@ -2975,7 +3955,9 @@ def actualizar_video():
 
     # La UI solo pinta resultados ya procesados.
     # Nunca llama hands.process(), por eso Tkinter no se bloquea.
-    root.after(1, actualizar_video)
+    # 8 ms evita sondear Tkinter ~1000 veces/s y mantiene una respuesta visual
+    # de hasta ~125 comprobaciones/s sin tocar la frecuencia real de MediaPipe.
+    root.after(UI_REFRESH_INTERVAL_MS, actualizar_video)
 
 
 # ==========================================================
@@ -3024,6 +4006,11 @@ _video_layout_state = {}
 
 def toggle_video_fullscreen(event=None):
     global video_fullscreen_active, _video_layout_state
+
+    # Presentación y pantalla completa de solo video son modos visuales
+    # mutuamente excluyentes. Salir de uno no altera reconocimiento/cámara.
+    if globals().get("presentation_mode_active", False):
+        salir_modo_presentacion()
 
     if not video_fullscreen_active:
         video_fullscreen_active = True
@@ -3093,21 +4080,12 @@ def salir_video_fullscreen(event=None):
 
     controls.pack(fill="x", padx=14, pady=(0, 8))
 
-    # IMPORTANTE: al salir de pantalla completa respetamos la sección
-    # que estaba activa antes de entrar. Si seguimos en "Inicio",
-    # el panel derecho debe continuar oculto y la cámara debe conservar
-    # todo el espacio libre.
-    if sidebar_active == "Inicio":
-        side_panel.grid_remove()
-        main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
-        main.grid_columnconfigure(1, weight=1, uniform="")
-        main.grid_columnconfigure(2, weight=0, minsize=0, uniform="")
-    else:
-        # En Traducir/otras vistas recuperamos la distribución normal.
-        side_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
-        main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
-        main.grid_columnconfigure(1, weight=6, uniform="main_content")
-        main.grid_columnconfigure(2, weight=3, minsize=0, uniform="main_content")
+    # Todas las pestañas usan ahora la misma geometría base; cada vista propia
+    # se superpone encima de esta área sin alterar el tamaño de las columnas.
+    side_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+    main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
+    main.grid_columnconfigure(1, weight=6, uniform="main_content")
+    main.grid_columnconfigure(2, weight=3, minsize=0, uniform="main_content")
 
     draw_fullscreen_icon()
 
@@ -3456,42 +4434,46 @@ import subprocess
 
 THEMES = {
     "Oscuro": {
-        # Paleta basada en la referencia: azul profundo + azul intenso.
-        "bg": "#01132B",
-        "topbar": "#00152E",
-        "panel": "#031A34",
-        "panel_alt": "#06213F",
-        "card": "#082746",
-        "border": "#164D86",
-        "text": "#F4F8FF",
-        "muted": "#8FB2D9",
-        "accent": "#004097",
+        # Base negro/grafito con un único acento azul. El azul se reserva para
+        # navegación activa, botones principales, foco y pequeños detalles UI.
+        "bg": "#080A0D",
+        "topbar": "#07090C",
+        "panel": "#101419",
+        "panel_alt": "#151A20",
+        "card": "#1A2027",
+        "border": "#293542",
+        "text": "#F4F7FA",
+        "muted": "#9AA6B2",
+        "accent": "#168FE8",
+        "accent_hover": "#2AA7FF",
         "accent_text": "#FFFFFF",
-        "button": "#062A52",
-        "button_active": "#0A4D9C",
-        "camera_bg": "#001021",
+        "button": "#1A2026",
+        "button_active": "#243545",
+        "camera_bg": "#050607",
         "ok": "#58D68D",
         "danger": "#FF6B6B",
-        "metric_line": "#2C72C8",
+        "metric_line": "#647585",
     },
     "Claro": {
-        # Versión clara de la misma identidad azul.
-        "bg": "#EEF5FF",
-        "topbar": "#F7FAFF",
+        # El modo claro conserva superficies blancas y utiliza bordes azulados
+        # suaves para que las tarjetas y controles tengan más definición.
+        "bg": "#F4F7FA",
+        "topbar": "#FFFFFF",
         "panel": "#FFFFFF",
-        "panel_alt": "#EDF4FC",
-        "card": "#F7FAFF",
-        "border": "#BDD1EB",
-        "text": "#0B1B33",
-        "muted": "#58708E",
-        "accent": "#004097",
+        "panel_alt": "#F3F7FB",
+        "card": "#FFFFFF",
+        "border": "#B9CEE2",
+        "text": "#17212B",
+        "muted": "#657482",
+        "accent": "#147FD1",
+        "accent_hover": "#0F6DB5",
         "accent_text": "#FFFFFF",
-        "button": "#E1ECFA",
-        "button_active": "#C9DCF3",
-        "camera_bg": "#001021",
+        "button": "#EDF3F8",
+        "button_active": "#DDECF8",
+        "camera_bg": "#050607",
         "ok": "#258C42",
         "danger": "#C74747",
-        "metric_line": "#2C72C8",
+        "metric_line": "#60788D",
     },
 }
 
@@ -3580,30 +4562,36 @@ def apply_theme(theme_name=None):
         foreground=[("readonly", c["text"])],
         selectbackground=[("readonly", c["button"])],
         selectforeground=[("readonly", c["text"])],
+        bordercolor=[("focus", c["accent"])],
+        lightcolor=[("focus", c["accent"])],
+        darkcolor=[("focus", c["accent"])],
     )
 
-    # Barra superior de sincronización de modelos.
+    # Barra de sincronización de modelos del menú lateral.
+    # El progreso se mantiene VERDE en ambos temas para que el estado sea
+    # reconocible de un vistazo, sin volver a introducir el antiguo azul.
+    model_sync_green = "#22C55E" if theme_name == "Oscuro" else "#16A34A"
     style.configure(
         "ModelSync.Horizontal.TProgressbar",
         troughcolor=c["panel_alt"],
-        background=c["accent"],
+        background=model_sync_green,
         bordercolor=c["border"],
-        lightcolor=c["accent"],
-        darkcolor=c["accent"],
+        lightcolor=model_sync_green,
+        darkcolor=model_sync_green,
         thickness=7,
     )
 
     if "model_sync_frame" in globals():
-        model_sync_frame.configure(bg=c["topbar"])
+        model_sync_frame.configure(bg=c["panel"], highlightbackground=c["border"])
     if "model_sync_label" in globals():
         estado_modelos = globals().get("model_sync_visual_state", "idle")
         color_modelos = (
             c["ok"] if estado_modelos in ("connected", "validated", "ready")
-            else c["accent"] if estado_modelos == "offline"
+            else c["muted"] if estado_modelos == "offline"
             else c["danger"] if estado_modelos == "error"
             else c["muted"]
         )
-        model_sync_label.configure(bg=c["topbar"], fg=color_modelos)
+        model_sync_label.configure(bg=c["panel"], fg=color_modelos)
 
     for widget, role in theme_widgets:
         try:
@@ -3636,12 +4624,18 @@ def apply_theme(theme_name=None):
             elif role == "primary_button":
                 widget.configure(
                     bg=c["accent"], fg=c["accent_text"],
-                    activebackground=c["text"], activeforeground=c["bg"]
+                    activebackground=c["accent_hover"], activeforeground=c["accent_text"],
+                    disabledforeground=c["muted"],
+                    highlightbackground=c["accent"], highlightcolor=c["accent"],
+                    highlightthickness=max(1, int(widget.cget("highlightthickness") or 0))
                 )
             elif role == "button":
                 widget.configure(
                     bg=c["button"], fg=c["text"],
-                    activebackground=c["button_active"], activeforeground=c["text"]
+                    activebackground=c["button_active"], activeforeground=c["text"],
+                    disabledforeground=c["muted"],
+                    highlightbackground=c["border"], highlightcolor=c["accent"],
+                    highlightthickness=max(1, int(widget.cget("highlightthickness") or 0))
                 )
         except tk.TclError:
             pass
@@ -3662,7 +4656,7 @@ def apply_theme(theme_name=None):
         account_message.configure(bg=c["panel"], fg=c["muted"])
         account_url.configure(
             bg=c["panel"],
-            fg="#11A8FF" if theme_name == "Oscuro" else "#0077C8",
+            fg=c["accent"],
         )
 
     if "settings_panel" in globals():
@@ -3672,6 +4666,20 @@ def apply_theme(theme_name=None):
         appearance_row.configure(bg=c["panel"])
         stabilization_row.configure(bg=c["panel"])
         settings_separator.configure(bg=c["border"])
+        if "performance_separator" in globals():
+            performance_separator.configure(bg=c["border"])
+        if "performance_label" in globals():
+            performance_label.configure(bg=c["panel"], fg=c["muted"])
+        if "performance_options" in globals():
+            performance_options.configure(bg=c["panel"])
+        if "turbo_mode_check" in globals():
+            turbo_mode_check.configure(
+                bg=c["panel"], fg=c["text"],
+                activebackground=c["panel"], activeforeground=c["text"],
+                selectcolor=c["button"],
+            )
+        if "performance_help" in globals():
+            performance_help.configure(bg=c["panel"], fg=c["muted"])
         if "landmarks_separator" in globals():
             landmarks_separator.configure(bg=c["border"])
         if "landmarks_label" in globals():
@@ -3825,7 +4833,7 @@ def apply_theme(theme_name=None):
     if "brand_que_hablan" in globals():
         brand_que_hablan.configure(
             bg=c["topbar"],
-            fg="#11A8FF" if theme_name == "Oscuro" else "#0077C8",
+            fg="#D2D4D8" if theme_name == "Oscuro" else "#3F3F3F",
         )
     if "brand_title" in globals():
         brand_title.configure(
@@ -3835,11 +4843,11 @@ def apply_theme(theme_name=None):
     if "brand_subtitle" in globals():
         brand_subtitle.configure(
             bg=c["topbar"],
-            fg="#16B7FF" if theme_name == "Oscuro" else "#0088CC",
+            fg="#A9ADB3" if theme_name == "Oscuro" else "#606060",
         )
     if "brand_separator" in globals():
         brand_separator.configure(
-            bg="#1D4D78" if theme_name == "Oscuro" else "#B7CDE3",
+            bg="#33363B" if theme_name == "Oscuro" else "#C8C8C8",
         )
 
     # Colores del menú lateral.
@@ -3852,9 +4860,9 @@ def apply_theme(theme_name=None):
     if "sidebar_brand_title1" in globals():
         sidebar_brand_title1.configure(bg=c["panel"], fg=c["text"])
     if "sidebar_brand_title2" in globals():
-        sidebar_brand_title2.configure(bg=c["panel"], fg="#12AFFF")
+        sidebar_brand_title2.configure(bg=c["panel"], fg="#D2D4D8" if theme_name == "Oscuro" else "#3F3F3F")
     if "sidebar_heart" in globals():
-        sidebar_heart.configure(bg=c["panel"], fg="#168EFF")
+        sidebar_heart.configure(bg=c["panel"], fg="#9EA3AA" if theme_name == "Oscuro" else "#686868")
     if "sidebar_slogan" in globals():
         sidebar_slogan.configure(bg=c["panel"], fg=c["muted"])
     if "sidebar_buttons" in globals():
@@ -4018,33 +5026,9 @@ brand_subtitle = tk.Label(
 header_controls = register_theme(tk.Frame(topbar), "topbar")
 header_controls.pack(side="right", padx=14, pady=5)
 
-# Indicador siempre visible del estado de los modelos. Se coloca a la izquierda
-# de los controles superiores para que pueda verse desde cualquier sección.
-model_sync_frame = register_theme(tk.Frame(topbar), "topbar")
-model_sync_frame.pack(side="right", padx=(6, 4), pady=5)
-
-model_sync_label = tk.Label(
-    model_sync_frame,
-    text="Modelos: preparando...",
-    font=("DejaVu Sans", 8, "bold"),
-    anchor="w",
-    width=62,
-)
-model_sync_label.pack(anchor="w", pady=(0, 2))
-
-model_sync_progress = ttk.Progressbar(
-    model_sync_frame,
-    style="ModelSync.Horizontal.TProgressbar",
-    orient="horizontal",
-    mode="determinate",
-    maximum=100,
-    value=0,
-    length=390,
-)
-model_sync_progress.pack(fill="x")
-
 theme_var = tk.StringVar(value="Sistema")
 stabilization_var = tk.StringVar(value="Baja")
+turbo_mode_var = tk.BooleanVar(value=TURBO_MODE_ENABLED)
 show_hand_points_var = tk.BooleanVar(value=SHOW_HAND_POINTS)
 show_face_points_var = tk.BooleanVar(value=SHOW_FACE_POINTS)
 settings_panel_visible = False
@@ -4097,6 +5081,24 @@ def seleccionar_estabilizacion(value):
     update_settings_controls()
 
 
+def actualizar_modo_turbo():
+    """Activa/desactiva optimizaciones de latencia sin alterar modelos ni umbrales."""
+    global TURBO_MODE_ENABLED
+    try:
+        TURBO_MODE_ENABLED = bool(turbo_mode_var.get())
+    except Exception:
+        TURBO_MODE_ENABLED = True
+
+    # Si se activa mientras la cámara ya está abierta, pedimos la frecuencia
+    # alta inmediatamente. Si el driver no puede, ignora la solicitud.
+    if TURBO_MODE_ENABLED and cap is not None:
+        try:
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
+        except Exception:
+            pass
+
+
 def actualizar_visibilidad_landmarks():
     """Cambia solo la visualización; reconocimiento y entrenamiento siguen activos."""
     global SHOW_HAND_POINTS, SHOW_FACE_POINTS
@@ -4114,7 +5116,10 @@ def actualizar_visibilidad_landmarks():
 
 def cerrar_panel_ajustes():
     global settings_panel_visible
-    settings_panel.place_forget()
+    try:
+        settings_viewport.place_forget()
+    except (NameError, tk.TclError):
+        settings_panel.place_forget()
     settings_panel_visible = False
 
 
@@ -4185,15 +5190,20 @@ def abrir_vista_configuracion():
     content_width = max(420, main.winfo_width() - SIDEBAR_FIXED_WIDTH - 6)
     content_height = max(360, main.winfo_height())
 
-    settings_panel.place(
+    settings_viewport.place(
         x=content_x,
         y=content_y,
         width=content_width,
         height=content_height,
     )
-    settings_panel.lift()
+    settings_viewport.lift()
     settings_panel_visible = True
     update_settings_controls()
+    try:
+        settings_canvas.yview_moveto(0.0)
+        root.after_idle(_refresh_settings_scrollregion)
+    except tk.TclError:
+        pass
 
 
 def abrir_vista_cuenta():
@@ -4839,13 +5849,77 @@ def abrir_ventana_entrenamiento():
     workspace = tk.Frame(container, bg=c["panel"])
     workspace.pack(fill="both", expand=True, padx=20, pady=(0, 14))
 
-    controls_panel = tk.Frame(
+    # Columna de controles desplazable. Así ningún botón queda cortado en
+    # pantallas pequeñas o cuando se muestran opciones avanzadas.
+    controls_viewport = tk.Frame(
         workspace,
         bg=c["panel"],
-        width=380,
+        width=390,
     )
-    controls_panel.pack(side="left", fill="y", padx=(0, 14))
-    controls_panel.pack_propagate(False)
+    controls_viewport.pack(side="left", fill="y", padx=(0, 14))
+    controls_viewport.pack_propagate(False)
+
+    controls_canvas = tk.Canvas(
+        controls_viewport,
+        bg=c["panel"],
+        bd=0,
+        highlightthickness=0,
+    )
+    controls_scrollbar = tk.Scrollbar(
+        controls_viewport,
+        orient="vertical",
+        command=controls_canvas.yview,
+    )
+    controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+    controls_scrollbar.pack(side="right", fill="y")
+    controls_canvas.pack(side="left", fill="both", expand=True)
+
+    controls_panel = tk.Frame(controls_canvas, bg=c["panel"])
+    controls_window = controls_canvas.create_window(
+        (0, 0), window=controls_panel, anchor="nw"
+    )
+
+    def _refresh_training_scroll(event=None):
+        try:
+            controls_canvas.configure(scrollregion=controls_canvas.bbox("all"))
+        except tk.TclError:
+            pass
+
+    def _fit_training_controls(event):
+        try:
+            controls_canvas.itemconfigure(controls_window, width=max(1, event.width))
+            win.after_idle(_refresh_training_scroll)
+        except tk.TclError:
+            pass
+
+    def _scroll_training(event):
+        try:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta:
+                step = -1 if delta > 0 else 1
+            else:
+                number = int(getattr(event, "num", 0) or 0)
+                step = -1 if number == 4 else 1 if number == 5 else 0
+            if step:
+                controls_canvas.yview_scroll(step * 3, "units")
+                return "break"
+        except (tk.TclError, ValueError, TypeError):
+            pass
+
+    def _enable_training_wheel(event=None):
+        win.bind_all("<MouseWheel>", _scroll_training)
+        win.bind_all("<Button-4>", _scroll_training)
+        win.bind_all("<Button-5>", _scroll_training)
+
+    def _disable_training_wheel(event=None):
+        win.unbind_all("<MouseWheel>")
+        win.unbind_all("<Button-4>")
+        win.unbind_all("<Button-5>")
+
+    controls_panel.bind("<Configure>", _refresh_training_scroll)
+    controls_canvas.bind("<Configure>", _fit_training_controls)
+    controls_viewport.bind("<Enter>", _enable_training_wheel)
+    controls_viewport.bind("<Leave>", _disable_training_wheel)
 
     # ----------------------------------------------------------
     # CÁMARA EN VIVO DE ENTRENAMIENTO
@@ -4896,7 +5970,7 @@ def abrir_ventana_entrenamiento():
     )
     name_label.pack(fill="x", pady=(0, 5))
 
-    sign_name_var = tk.StringVar()
+    sign_name_var = tk.StringVar(value=str(globals().pop("training_prefill_sign_name", "")))
     sign_entry = tk.Entry(
         name_box,
         textvariable=sign_name_var,
@@ -5279,6 +6353,11 @@ def abrir_ventana_entrenamiento():
         "motion_frames": [],
         "motion_started_at": 0.0,
         "motion_duration": 1.20,
+        # Para capturas estáticas automáticas: evita llenar el JSON con copias
+        # casi idénticas del mismo frame, pero fuerza una muestra cada poco
+        # tiempo para que el lote nunca se quede bloqueado.
+        "last_static_vector": None,
+        "skipped_similar": 0,
     }
 
     def intervalo_seleccionado():
@@ -5401,6 +6480,30 @@ def abrir_ventana_entrenamiento():
             status_var.set(f"Serie terminada: {captured} muestras de {nombre} guardadas.")
         progress_var.set(f"Guardadas en esta serie: {captured}")
 
+    def muestra_estatica_suficientemente_distinta(sample, now):
+        """Reduce duplicados consecutivos sin impedir una captura rápida."""
+        feature = _vector_reconocimiento(sample.get("hands", [])) if isinstance(sample, dict) else None
+        if feature is None:
+            return True, None
+        try:
+            current = np.asarray(feature["vector"], dtype=np.float32)
+        except Exception:
+            return True, None
+
+        previous = capture_job.get("last_static_vector")
+        if previous is None or previous.shape != current.shape:
+            return True, current
+
+        distance = float(np.sqrt(np.mean((current - previous) ** 2)))
+        elapsed = now - float(capture_job.get("last_saved_time", 0.0) or 0.0)
+
+        # 0.003 es un umbral muy pequeño: solo descarta casi-clones. Aun sin
+        # mover la mano, cada 70 ms permitimos otra muestra para no frenar lotes.
+        if distance < 0.003 and elapsed < 0.070:
+            return False, current
+        return True, current
+
+
     def capturar_paso():
         if not capture_job["running"]:
             return
@@ -5509,26 +6612,32 @@ def abrir_ventana_entrenamiento():
 
             elapsed = now - capture_job["last_saved_time"]
             if capture_job["last_saved_time"] == 0.0 or elapsed >= capture_job["min_interval"]:
-                capture_job["data"]["samples"].append(sample)
-                capture_job["captured"] += 1
-                capture_job["last_saved_time"] = now
+                guardar, current_vector = muestra_estatica_suficientemente_distinta(sample, now)
+                if guardar:
+                    capture_job["data"]["samples"].append(sample)
+                    capture_job["captured"] += 1
+                    capture_job["last_saved_time"] = now
+                    if current_vector is not None:
+                        capture_job["last_static_vector"] = current_vector
 
-                if capture_job["mode"] == "batch":
-                    progress_var.set(
-                        f"Capturando: {capture_job['captured']}/{capture_job['target']}"
-                    )
-                    status_var.set(
-                        f"{velocidad_var.get()} · {capture_job['hand_filter']} · "
-                        f"faltan {max(0, capture_job['target'] - capture_job['captured'])}"
-                    )
+                    if capture_job["mode"] == "batch":
+                        progress_var.set(
+                            f"Capturando: {capture_job['captured']}/{capture_job['target']}"
+                        )
+                        status_var.set(
+                            f"{velocidad_var.get()} · {capture_job['hand_filter']} · "
+                            f"faltan {max(0, capture_job['target'] - capture_job['captured'])}"
+                        )
+                    else:
+                        progress_var.set(
+                            f"Captura continua: {capture_job['captured']} muestras"
+                        )
+                        status_var.set(
+                            f"Capturando sin límite · {velocidad_var.get()} · "
+                            "pulsa Detener cuando tengas suficientes muestras."
+                        )
                 else:
-                    progress_var.set(
-                        f"Captura continua: {capture_job['captured']} muestras"
-                    )
-                    status_var.set(
-                        f"Capturando sin límite · {velocidad_var.get()} · "
-                        "pulsa Detener cuando tengas suficientes muestras."
-                    )
+                    capture_job["skipped_similar"] += 1
         else:
             progress_var.set(f"Capturadas: {capture_job['captured']} · esperando mano")
             status_var.set(
@@ -5546,6 +6655,8 @@ def abrir_ventana_entrenamiento():
         capture_job["last_saved_time"] = 0.0
         capture_job["motion_frames"] = []
         capture_job["motion_started_at"] = 0.0
+        capture_job["last_static_vector"] = None
+        capture_job["skipped_similar"] = 0
         if capture_job["mode"] == "motion":
             progress_var.set("Movimiento: esperando mano")
             extra = " Mantén también el rostro visible." if capture_job.get("include_face") else ""
@@ -5607,6 +6718,8 @@ def abrir_ventana_entrenamiento():
         capture_job["data"] = cargar_dataset(nombre)
         capture_job["motion_frames"] = []
         capture_job["motion_started_at"] = 0.0
+        capture_job["last_static_vector"] = None
+        capture_job["skipped_similar"] = 0
 
         capture_one.configure(state="disabled")
         try:
@@ -5642,6 +6755,611 @@ def abrir_ventana_entrenamiento():
     def capturar_movimiento():
         """Graba una ejecución completa de una seña dinámica (~1.2 s)."""
         preparar_captura("motion")
+
+    # ----------------------------------------------------------
+    # ENTRENAMIENTO DESDE VIDEO
+    # ----------------------------------------------------------
+    # El video NO usa la cámara principal ni el objeto MediaPipe global. Se crea
+    # un detector independiente dentro del hilo del video para no interferir con
+    # el seguimiento en vivo. El resultado se guarda con el MISMO formato JSON
+    # que ya usa el entrenamiento por cámara.
+    video_training_state = {
+        "running": False,
+        "cancelled": False,
+        "queue": queue.Queue(),
+        "after_id": None,
+    }
+
+    def _hands_data_desde_resultado_video(results):
+        """Convierte el resultado de MediaPipe del video al formato interno de la app."""
+        output = []
+        if not results or not results.multi_hand_landmarks:
+            return output
+
+        for hand_index, hand_landmarks in enumerate(results.multi_hand_landmarks):
+            hand_label = f"hand_{hand_index}"
+            if results.multi_handedness and hand_index < len(results.multi_handedness):
+                try:
+                    hand_label = results.multi_handedness[hand_index].classification[0].label
+                except Exception:
+                    pass
+
+            output.append({
+                "handedness": str(hand_label),
+                "landmarks": [
+                    {"x": float(lm.x), "y": float(lm.y), "z": float(lm.z)}
+                    for lm in hand_landmarks.landmark
+                ],
+            })
+        return output
+
+    def _seleccionar_muestras_estaticas_video(frames, max_samples):
+        """Toma muestras repartidas por el clip cuando la seña casi no tiene movimiento."""
+        if not frames:
+            return []
+        max_samples = max(1, int(max_samples or 1))
+        if len(frames) <= max_samples:
+            selected = frames
+        elif max_samples == 1:
+            selected = [frames[len(frames) // 2]]
+        else:
+            last = len(frames) - 1
+            indices = [round(i * last / (max_samples - 1)) for i in range(max_samples)]
+            selected = [frames[index] for index in indices]
+
+        samples = []
+        for frame_data in selected:
+            sample = {
+                "label": "",  # guardar_dataset() coloca el nombre definitivo.
+                "timestamp": time.time(),
+                "hands": frame_data.get("hands", []),
+            }
+            if frame_data.get("face") is not None:
+                sample["face"] = frame_data["face"]
+            samples.append(sample)
+        return samples
+
+    def _generar_variantes_dinamicas_video(frames, nombre, total_muestras):
+        """
+        Genera varias ejecuciones sintéticas a partir de UN solo video.
+
+        No duplica el clip de forma idéntica: conserva una muestra original y
+        crea variaciones leves de recorte temporal, velocidad/muestreo y
+        landmarks. Mantiene la cantidad de manos y su handedness.
+        """
+        if not frames:
+            return []
+
+        try:
+            total_muestras = max(1, min(200, int(total_muestras or 1)))
+        except (TypeError, ValueError):
+            total_muestras = 30
+
+        # Semilla distinta para cada importación, pero estable durante este proceso.
+        rng = np.random.default_rng(int(time.time_ns() & 0xFFFFFFFF))
+
+        def copiar_frame(frame_data, jitter_xy=0.0, jitter_z=0.0, rotate_deg=0.0):
+            salida = {
+                "t": float(frame_data.get("t", 0.0)),
+                "hands": [],
+            }
+
+            angle = np.deg2rad(float(rotate_deg))
+            ca = float(np.cos(angle))
+            sa = float(np.sin(angle))
+
+            for hand in frame_data.get("hands", []):
+                landmarks = hand.get("landmarks", [])
+                if len(landmarks) != 21:
+                    continue
+
+                try:
+                    wx = float(landmarks[0]["x"])
+                    wy = float(landmarks[0]["y"])
+                except Exception:
+                    continue
+
+                nuevos = []
+                for lm_index, lm in enumerate(landmarks):
+                    x = float(lm["x"])
+                    y = float(lm["y"])
+                    z = float(lm["z"])
+
+                    # Rotación mínima alrededor de la muñeca para simular pequeñas
+                    # diferencias de ejecución sin cambiar la mano izquierda/derecha.
+                    dx = x - wx
+                    dy = y - wy
+                    xr = wx + dx * ca - dy * sa
+                    yr = wy + dx * sa + dy * ca
+
+                    # Ruido muy pequeño. La muñeca recibe menos jitter porque es
+                    # el origen usado por la normalización de la seña dinámica.
+                    factor = 0.35 if lm_index == 0 else 1.0
+                    xr += float(rng.normal(0.0, jitter_xy * factor))
+                    yr += float(rng.normal(0.0, jitter_xy * factor))
+                    z += float(rng.normal(0.0, jitter_z * factor))
+
+                    # MediaPipe normalmente entrega x/y normalizados. Evitamos
+                    # variaciones sintéticas fuera del rango visual razonable.
+                    xr = max(-0.10, min(1.10, xr))
+                    yr = max(-0.10, min(1.10, yr))
+                    z = max(-2.0, min(2.0, z))
+                    nuevos.append({"x": xr, "y": yr, "z": z})
+
+                salida["hands"].append({
+                    "handedness": str(hand.get("handedness", "Unknown")),
+                    "landmarks": nuevos,
+                })
+
+            face = frame_data.get("face")
+            if isinstance(face, dict):
+                vector = _vector_facial_desde_dato(face)
+                if vector is not None:
+                    # Cara: perturbación aún menor porque son rasgos geométricos,
+                    # no coordenadas crudas de Face Mesh.
+                    face_sigma = min(0.0015, max(0.00025, jitter_xy * 0.40))
+                    salida["face"] = {
+                        "version": int(face.get("version", 1)),
+                        "vector": [
+                            float(v + rng.normal(0.0, face_sigma))
+                            for v in vector
+                        ],
+                    }
+
+            return salida
+
+        # 1) Siempre guardamos la ejecución real/original.
+        muestras = [{
+            "label": nombre,
+            "timestamp": time.time(),
+            "type": "dynamic",
+            "frames": [copiar_frame(item) for item in frames],
+            "augmentation": {"kind": "original"},
+        }]
+
+        if total_muestras <= 1:
+            return muestras
+
+        n = len(frames)
+        intentos = 0
+        max_intentos = max(80, total_muestras * 12)
+
+        while len(muestras) < total_muestras and intentos < max_intentos:
+            intentos += 1
+
+            # Recortamos como máximo ~8% de cada extremo. Esto enseña tolerancia
+            # a empezar/terminar la seña unos frames antes o después.
+            max_trim = max(0, min(int(n * 0.08), (n - DYNAMIC_MIN_FRAMES) // 2))
+            trim_inicio = int(rng.integers(0, max_trim + 1)) if max_trim else 0
+            trim_final = int(rng.integers(0, max_trim + 1)) if max_trim else 0
+            inicio = trim_inicio
+            fin = n - trim_final
+            if fin - inicio < DYNAMIC_MIN_FRAMES:
+                continue
+
+            base = frames[inicio:fin]
+            m = len(base)
+
+            # Gamma < 1 adelanta el movimiento; gamma > 1 lo retrasa. Al volver
+            # a 16 pasos en el reconocedor se conserva una variación temporal real.
+            gamma = float(rng.uniform(0.82, 1.18))
+
+            # También variamos ligeramente cuántos frames intermedios quedan.
+            longitud_objetivo = int(round(m * float(rng.uniform(0.82, 1.12))))
+            longitud_objetivo = max(DYNAMIC_MIN_FRAMES, min(m + 6, longitud_objetivo))
+
+            if longitud_objetivo <= 1:
+                continue
+
+            indices = []
+            for k in range(longitud_objetivo):
+                u = k / (longitud_objetivo - 1)
+                warped = u ** gamma
+                idx = int(round(warped * (m - 1)))
+                idx = max(0, min(m - 1, idx))
+                indices.append(idx)
+
+            jitter_xy = float(rng.uniform(0.0007, 0.0028))
+            jitter_z = float(rng.uniform(0.0004, 0.0018))
+            rotate_deg = float(rng.uniform(-2.2, 2.2))
+
+            frames_variante = [
+                copiar_frame(
+                    base[idx],
+                    jitter_xy=jitter_xy,
+                    jitter_z=jitter_z,
+                    rotate_deg=rotate_deg,
+                )
+                for idx in indices
+            ]
+
+            # Solo aceptamos variaciones que sigan siendo una seña dinámica válida
+            # para EXACTAMENTE el mismo pipeline que usa el reconocimiento.
+            feature = _vectorizar_secuencia_movimiento(frames_variante)
+            if feature is None:
+                continue
+            if feature["motion"] < DYNAMIC_MIN_MOTION * 0.70:
+                continue
+
+            original_hand_count = len(frames[0].get("hands", []))
+            if int(feature.get("hand_count", 0)) != int(original_hand_count):
+                continue
+
+            muestras.append({
+                "label": nombre,
+                "timestamp": time.time(),
+                "type": "dynamic",
+                "frames": frames_variante,
+                "augmentation": {
+                    "kind": "synthetic",
+                    "source": "single_video",
+                    "trim_start": trim_inicio,
+                    "trim_end": trim_final,
+                    "time_gamma": round(gamma, 5),
+                    "jitter_xy": round(jitter_xy, 7),
+                    "jitter_z": round(jitter_z, 7),
+                    "rotation_deg": round(rotate_deg, 4),
+                },
+            })
+
+        return muestras
+
+    def _poner_video_ui_ocupada(ocupada):
+        state = "disabled" if ocupada else "normal"
+        # Estos widgets se crean más abajo en esta misma ventana. La función solo
+        # se ejecuta después de que la interfaz terminó de construirse.
+        for widget in (
+            capture_one,
+            capture_many,
+            capture_continuous,
+            capture_motion,
+            import_video_button,
+            save_as_button,
+        ):
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def procesar_cola_video_entrenamiento():
+        """Aplica en el hilo de Tkinter los avances/resultados producidos por el worker."""
+        video_training_state["after_id"] = None
+        try:
+            if not win.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        ultimo_progreso = None
+        final = None
+        try:
+            while True:
+                item = video_training_state["queue"].get_nowait()
+                if item and item[0] == "progress":
+                    ultimo_progreso = item
+                elif item and item[0] in ("done", "error", "cancelled"):
+                    final = item
+        except queue.Empty:
+            pass
+
+        if ultimo_progreso is not None:
+            _, porcentaje, detalle = ultimo_progreso
+            progress_var.set(f"Procesando video: {porcentaje}%")
+            status_var.set(detalle)
+
+        if final is not None:
+            video_training_state["running"] = False
+            _poner_video_ui_ocupada(False)
+            tipo = final[0]
+
+            if tipo == "cancelled":
+                progress_var.set("Procesamiento de video cancelado")
+                status_var.set("Se canceló el procesamiento del video.")
+                return
+
+            if tipo == "error":
+                mensaje = str(final[1])
+                progress_var.set("No se pudo procesar el video")
+                status_var.set(mensaje)
+                messagebox.showerror("Video no procesado", mensaje, parent=win)
+                return
+
+            _, nombre, muestras, clase, info = final
+            try:
+                data = cargar_dataset(nombre)
+                for sample in muestras:
+                    sample = dict(sample)
+                    sample["label"] = nombre
+                    data["samples"].append(sample)
+                guardar_dataset(data, nombre)
+                actualizar_contador(data)
+
+                if clase == "dynamic":
+                    generadas = len(muestras)
+                    sinteticas = max(0, generadas - 1)
+                    progress_var.set(f"Video guardado: {generadas} muestras dinámicas")
+                    status_var.set(
+                        f"{nombre}: 1 ejecución real + {sinteticas} variaciones automáticas · {info}. "
+                        "El modelo ya quedó recargado en RAM y listo para probar en Traducir."
+                    )
+                else:
+                    progress_var.set(f"Video guardado: {len(muestras)} muestras estáticas")
+                    status_var.set(
+                        f"Video de {nombre} procesado correctamente · {info}."
+                    )
+            except Exception as exc:
+                progress_var.set("Error al guardar el entrenamiento")
+                status_var.set(f"El video se procesó, pero no se pudo guardar: {exc}")
+                messagebox.showerror(
+                    "No se pudo guardar",
+                    f"El video se procesó, pero no se pudo guardar el modelo:\n\n{exc}",
+                    parent=win,
+                )
+            return
+
+        if video_training_state["running"]:
+            video_training_state["after_id"] = win.after(40, procesar_cola_video_entrenamiento)
+
+    def _worker_entrenar_desde_video(ruta_video, nombre, filtro, incluir_cara, max_static_samples):
+        video_cap = None
+        video_hands = None
+        video_face = None
+        try:
+            video_cap = cv2.VideoCapture(str(ruta_video))
+            if not video_cap.isOpened():
+                raise ValueError("No pude abrir el archivo de video seleccionado.")
+
+            total_frames = int(video_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            fps_video = float(video_cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if fps_video <= 1.0 or fps_video > 240.0:
+                fps_video = 30.0
+
+            # Procesamos como máximo ~30 FPS. Un video de 60/120 FPS no necesita
+            # duplicar trabajo para obtener una secuencia útil de landmarks.
+            salto = max(1, int(round(fps_video / 30.0)))
+
+            video_hands = mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                model_complexity=0,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+
+            if incluir_cara and FACE_MESH_AVAILABLE:
+                video_face = mp_face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=1,
+                    refine_landmarks=False,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
+
+            frames_validos = []
+            indice = 0
+            procesados = 0
+            ultimo_pct = -1
+
+            while True:
+                if video_training_state.get("cancelled"):
+                    video_training_state["queue"].put(("cancelled",))
+                    return
+
+                ok, frame = video_cap.read()
+                if not ok:
+                    break
+
+                indice += 1
+                if (indice - 1) % salto != 0:
+                    continue
+
+                # La cámara en vivo se voltea antes de MediaPipe. Hacemos lo mismo
+                # para que un modelo creado desde video tenga la misma orientación.
+                frame = cv2.flip(frame, 1)
+                small = cv2.resize(
+                    frame,
+                    (PROCESS_WIDTH, PROCESS_HEIGHT),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                rgb.flags.writeable = False
+                hand_results = video_hands.process(rgb)
+                rgb.flags.writeable = True
+
+                hands_data = _hands_data_desde_resultado_video(hand_results)
+                hands_data = filtrar_manos(hands_data, filtro)
+
+                face_data = None
+                if video_face is not None:
+                    rgb_face = cv2.cvtColor(
+                        cv2.resize(
+                            frame,
+                            (FACE_PROCESS_WIDTH, FACE_PROCESS_HEIGHT),
+                            interpolation=cv2.INTER_LINEAR,
+                        ),
+                        cv2.COLOR_BGR2RGB,
+                    )
+                    rgb_face.flags.writeable = False
+                    face_results = video_face.process(rgb_face)
+                    rgb_face.flags.writeable = True
+                    if face_results.multi_face_landmarks:
+                        face_data = _extraer_vector_facial(face_results.multi_face_landmarks[0])
+
+                if hands_data:
+                    item = {
+                        "t": (indice - 1) / fps_video,
+                        "hands": hands_data,
+                    }
+                    if face_data is not None:
+                        item["face"] = face_data
+                    frames_validos.append(item)
+
+                procesados += 1
+                if total_frames > 0:
+                    pct = min(99, int(indice * 100 / total_frames))
+                else:
+                    pct = min(99, int((procesados % 100)))
+                if pct != ultimo_pct and (pct % 2 == 0 or pct >= 98):
+                    ultimo_pct = pct
+                    video_training_state["queue"].put((
+                        "progress",
+                        pct,
+                        f"Analizando manos{' y rostro' if incluir_cara else ''} · "
+                        f"{len(frames_validos)} frames útiles encontrados.",
+                    ))
+
+            if len(frames_validos) < DYNAMIC_MIN_FRAMES:
+                raise ValueError(
+                    "No encontré suficientes frames con la mano visible. "
+                    "Usa un video donde la seña se vea completa y con buena iluminación."
+                )
+
+            # Para clips de dos manos evitamos que una pérdida breve de una mano al
+            # inicio decida toda la secuencia. Conservamos la cantidad de manos que
+            # aparece en la mayoría de los frames útiles.
+            conteo_manos = {}
+            for item in frames_validos:
+                cantidad = len(item.get("hands", []))
+                if cantidad > 0:
+                    conteo_manos[cantidad] = conteo_manos.get(cantidad, 0) + 1
+            if conteo_manos:
+                cantidad_dominante = max(
+                    conteo_manos,
+                    key=lambda cantidad: (conteo_manos[cantidad], cantidad),
+                )
+                frames_dominantes = [
+                    item for item in frames_validos
+                    if len(item.get("hands", [])) == cantidad_dominante
+                ]
+                if len(frames_dominantes) >= DYNAMIC_MIN_FRAMES:
+                    frames_validos = frames_dominantes
+
+            if incluir_cara:
+                frames_con_cara = sum(1 for item in frames_validos if item.get("face") is not None)
+                minimo_cara = max(2, int(len(frames_validos) * 0.40))
+                if frames_con_cara < minimo_cara:
+                    raise ValueError(
+                        "Marcaste 'Incluir gestos faciales', pero el rostro no se detectó "
+                        "durante suficiente parte del video."
+                    )
+
+            # El reconocedor ya sabe leer clips dinámicos. Si el clip contiene
+            # movimiento suficiente, el campo CANTIDAD controla cuántas muestras
+            # se generan a partir de este único video: 1 original + variaciones.
+            feature = _vectorizar_secuencia_movimiento(frames_validos)
+            if feature is not None and feature["motion"] >= DYNAMIC_MIN_MOTION:
+                muestras_dinamicas = _generar_variantes_dinamicas_video(
+                    frames_validos,
+                    nombre,
+                    max_static_samples,
+                )
+                if not muestras_dinamicas:
+                    raise ValueError("No se pudieron generar muestras dinámicas válidas.")
+
+                info = (
+                    f"{len(frames_validos)} frames útiles · "
+                    f"movimiento {feature['motion']:.3f} · "
+                    f"{len(muestras_dinamicas)} muestras generadas"
+                )
+                video_training_state["queue"].put((
+                    "done", nombre, muestras_dinamicas, "dynamic", info
+                ))
+                return
+
+            # Si casi no hubo trayectoria, el video sigue siendo útil: lo convertimos
+            # en varias poses estáticas repartidas a lo largo del clip.
+            muestras = _seleccionar_muestras_estaticas_video(
+                frames_validos,
+                max_static_samples,
+            )
+            if not muestras:
+                raise ValueError("No se pudieron extraer muestras válidas del video.")
+
+            info = f"{len(frames_validos)} frames útiles · seña prácticamente estática"
+            video_training_state["queue"].put((
+                "done", nombre, muestras, "static", info
+            ))
+
+        except Exception as exc:
+            video_training_state["queue"].put(("error", str(exc)))
+        finally:
+            try:
+                if video_cap is not None:
+                    video_cap.release()
+            except Exception:
+                pass
+            try:
+                if video_hands is not None:
+                    video_hands.close()
+            except Exception:
+                pass
+            try:
+                if video_face is not None:
+                    video_face.close()
+            except Exception:
+                pass
+
+    def importar_video_entrenamiento():
+        """Selecciona un clip y lo convierte en entrenamiento compatible con la app."""
+        if capture_job["running"]:
+            status_var.set("Detén la captura de cámara antes de importar un video.")
+            return
+        if video_training_state["running"]:
+            status_var.set("Ya estoy procesando un video.")
+            return
+
+        nombre = sign_name_var.get().strip().upper()
+        if not nombre:
+            messagebox.showinfo(
+                "Nombre de la seña",
+                "Primero escribe el nombre de la seña que aparece en el video.",
+                parent=win,
+            )
+            return
+
+        ruta = filedialog.askopenfilename(
+            parent=win,
+            title="Seleccionar video para entrenar",
+            filetypes=[
+                ("Videos", "*.mp4 *.mov *.avi *.mkv *.webm *.m4v"),
+                ("MP4", "*.mp4"),
+                ("Todos los archivos", "*.*"),
+            ],
+        )
+        if not ruta:
+            return
+
+        try:
+            max_static_samples = max(1, int(cantidad_var.get()))
+        except ValueError:
+            max_static_samples = 30
+
+        filtro = hand_filter_var.get()
+        incluir_cara = bool(include_face_var.get()) and FACE_MESH_AVAILABLE
+
+        # Vacía mensajes viejos por seguridad.
+        try:
+            while True:
+                video_training_state["queue"].get_nowait()
+        except queue.Empty:
+            pass
+
+        video_training_state["running"] = True
+        video_training_state["cancelled"] = False
+        _poner_video_ui_ocupada(True)
+        progress_var.set("Procesando video: 0%")
+        status_var.set(
+            f"Importando video sin usar la cámara · objetivo: {max_static_samples} muestras automáticas."
+        )
+
+        threading.Thread(
+            target=_worker_entrenar_desde_video,
+            args=(ruta, nombre, filtro, incluir_cara, max_static_samples),
+            daemon=True,
+            name="TrainingVideoProcessor",
+        ).start()
+
+        video_training_state["after_id"] = win.after(40, procesar_cola_video_entrenamiento)
 
     def guardar_modelo_como():
         """Exporta una copia del modelo entrenado a la ruta/nombre elegidos."""
@@ -5781,6 +7499,43 @@ def abrir_ventana_entrenamiento():
     )
 
     # ----------------------------------------------------------
+    # IMPORTAR VIDEO PARA ENTRENAR
+    # No necesita iniciar la cámara. Un clip = una ejecución de la seña.
+    # ----------------------------------------------------------
+    import_video_button = tk.Button(
+        controls_panel,
+        text="🎬  IMPORTAR VIDEO PARA ENTRENAR",
+        command=importar_video_entrenamiento,
+        relief="flat", bd=0, highlightthickness=1,
+        bg=c["button"], fg=c["text"],
+        activebackground=c["button_active"], activeforeground=c["text"],
+        highlightbackground=c["border"],
+        font=("DejaVu Sans", 9, "bold"),
+        padx=12, pady=10, cursor="hand2",
+    )
+    import_video_button.pack(
+        fill="x",
+        pady=(0, 5),
+        before=options_shell,
+    )
+
+    import_video_help = tk.Label(
+        controls_panel,
+        text=(
+            "Usa un clip corto con una ejecución completa. No necesitas encender la cámara. "
+            "Si hay movimiento se guarda como secuencia; si no, extrae poses estáticas."
+        ),
+        bg=c["panel"], fg=c["muted"],
+        font=("DejaVu Sans", 8),
+        anchor="w", justify="left", wraplength=350,
+    )
+    import_video_help.pack(
+        fill="x",
+        pady=(0, 8),
+        before=options_shell,
+    )
+
+    # ----------------------------------------------------------
     # BOTONES DE CAPTURA
     # ----------------------------------------------------------
     buttons = tk.Frame(controls_panel, bg=c["panel"])
@@ -5825,9 +7580,399 @@ def abrir_ventana_entrenamiento():
     )
     capture_continuous.pack(fill="x", pady=(0, 6))
 
+    # ==========================================================
+    # ASISTENTE VISUAL DE ENTRENAMIENTO · IDEAS 7–10 Y 12
+    # ==========================================================
+    # IMPORTANTE: esta sección solo reorganiza los widgets y llama a las mismas
+    # funciones de captura/importación/guardado definidas arriba. No modifica
+    # MediaPipe, landmarks, reconocimiento, vectores, umbrales ni el JSON.
+    training_step_var = tk.IntVar(value=1)
+    training_type_var = tk.StringVar(value="Estática")
+    training_advanced_visible = tk.BooleanVar(value=False)
+
+    step_bar = tk.Frame(controls_panel, bg=c["panel"])
+    step_bar.pack(fill="x", pady=(0, 10), before=form_row)
+    step_labels = []
+    for numero, texto_paso in ((1, "1 · Tipo"), (2, "2 · Captura"), (3, "3 · Revisar")):
+        lbl = tk.Label(
+            step_bar,
+            text=texto_paso,
+            bg=c["button"], fg=c["muted"],
+            font=("DejaVu Sans", 8, "bold"),
+            padx=7, pady=6,
+            highlightthickness=1,
+            highlightbackground=c["border"],
+        )
+        lbl.pack(side="left", expand=True, fill="x", padx=(0, 5) if numero < 3 else 0)
+        step_labels.append(lbl)
+
+    type_shell = tk.Frame(
+        controls_panel,
+        bg=c["panel_alt"],
+        highlightthickness=1,
+        highlightbackground=c["border"],
+    )
+    type_title = tk.Label(
+        type_shell,
+        text="TIPO DE SEÑA",
+        bg=c["panel_alt"], fg=c["muted"],
+        font=("DejaVu Sans", 8, "bold"), anchor="w",
+    )
+    type_title.pack(fill="x", padx=12, pady=(10, 7))
+
+    type_cards = tk.Frame(type_shell, bg=c["panel_alt"])
+    type_cards.pack(fill="x", padx=12, pady=(0, 10))
+    type_cards.grid_columnconfigure(0, weight=1, uniform="training_type")
+    type_cards.grid_columnconfigure(1, weight=1, uniform="training_type")
+
+    static_type_button = tk.Button(
+        type_cards,
+        text="✋  Seña estática\nLetras o poses",
+        relief="flat", bd=0, highlightthickness=1,
+        font=("DejaVu Sans", 9, "bold"),
+        padx=8, pady=10, cursor="hand2",
+    )
+    static_type_button.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+
+    dynamic_type_button = tk.Button(
+        type_cards,
+        text="🎥  Seña con movimiento\nPalabras o trayectorias",
+        relief="flat", bd=0, highlightthickness=1,
+        font=("DejaVu Sans", 9, "bold"),
+        padx=8, pady=10, cursor="hand2",
+    )
+    dynamic_type_button.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+
+    type_help_var = tk.StringVar(
+        value="Elige cómo vas a registrar la seña. Esto solo organiza los controles; el formato real lo conserva la lógica existente."
+    )
+    type_help = tk.Label(
+        type_shell,
+        textvariable=type_help_var,
+        bg=c["panel_alt"], fg=c["muted"],
+        font=("DejaVu Sans", 8), anchor="w", justify="left", wraplength=340,
+    )
+    type_help.pack(fill="x", padx=12, pady=(0, 10))
+
+    capture_stage_title = tk.Label(
+        controls_panel,
+        text="CAPTURA O IMPORTACIÓN",
+        bg=c["panel"], fg=c["muted"],
+        font=("DejaVu Sans", 8, "bold"), anchor="w",
+    )
+
+    capture_stage_help = tk.Label(
+        controls_panel,
+        text="Usa la cámara o importa un video. Las funciones internas siguen siendo las mismas.",
+        bg=c["panel"], fg=c["muted"],
+        font=("DejaVu Sans", 8), anchor="w", justify="left", wraplength=355,
+    )
+
+    advanced_toggle_button = tk.Button(
+        controls_panel,
+        text="⚙  Opciones avanzadas",
+        relief="flat", bd=0, highlightthickness=1,
+        bg=c["button"], fg=c["text"],
+        activebackground=c["button_active"], activeforeground=c["text"],
+        highlightbackground=c["border"],
+        font=("DejaVu Sans", 8, "bold"), padx=9, pady=7, cursor="hand2",
+    )
+
+    video_pipeline_var = tk.StringVar(
+        value="Video  →  manos  →  secuencia válida  →  variaciones  →  modelo listo"
+    )
+    video_pipeline = tk.Label(
+        controls_panel,
+        textvariable=video_pipeline_var,
+        bg=c["panel_alt"], fg=c["muted"],
+        font=("DejaVu Sans", 8, "bold"),
+        anchor="w", justify="left", wraplength=355,
+        padx=10, pady=9,
+        highlightthickness=1,
+        highlightbackground=c["border"],
+    )
+
+    review_shell = tk.Frame(
+        controls_panel,
+        bg=c["panel_alt"],
+        highlightthickness=1,
+        highlightbackground=c["border"],
+    )
+    review_title = tk.Label(
+        review_shell,
+        text="RESUMEN DEL MODELO",
+        bg=c["panel_alt"], fg=c["muted"],
+        font=("DejaVu Sans", 8, "bold"), anchor="w",
+    )
+    review_title.pack(fill="x", padx=12, pady=(10, 4))
+    quality_var = tk.StringVar(value="Sin muestras todavía")
+    quality_label = tk.Label(
+        review_shell,
+        textvariable=quality_var,
+        bg=c["panel_alt"], fg=c["text"],
+        font=("DejaVu Sans", 10, "bold"), anchor="w", justify="left",
+    )
+    quality_label.pack(fill="x", padx=12, pady=(0, 4))
+    quality_help = tk.Label(
+        review_shell,
+        text="Indicador orientativo basado en cantidad y diversidad de muestras; no representa precisión científica.",
+        bg=c["panel_alt"], fg=c["muted"],
+        font=("DejaVu Sans", 8), anchor="w", justify="left", wraplength=335,
+    )
+    quality_help.pack(fill="x", padx=12, pady=(0, 10))
+
+    test_model_button = tk.Button(
+        controls_panel,
+        text="▶  PROBAR MODELO EN TRADUCIR",
+        relief="flat", bd=0, highlightthickness=1,
+        bg=c["accent"], fg=c["accent_text"],
+        activebackground=c["accent_hover"], activeforeground=c["accent_text"],
+        highlightbackground=c["accent"],
+        font=("DejaVu Sans", 9, "bold"), padx=12, pady=10,
+        cursor="hand2", state="disabled",
+    )
+
+    wizard_nav = tk.Frame(controls_panel, bg=c["panel"])
+    back_step_button = tk.Button(
+        wizard_nav, text="← Anterior", relief="flat", bd=0,
+        highlightthickness=1, bg=c["button"], fg=c["text"],
+        activebackground=c["button_active"], activeforeground=c["text"],
+        highlightbackground=c["border"], font=("DejaVu Sans", 8, "bold"),
+        padx=10, pady=8, cursor="hand2",
+    )
+    back_step_button.pack(side="left", expand=True, fill="x", padx=(0, 5))
+    next_step_button = tk.Button(
+        wizard_nav, text="Siguiente →", relief="flat", bd=0,
+        highlightthickness=1, bg=c["accent"], fg=c["accent_text"],
+        activebackground=c["accent_hover"], activeforeground=c["accent_text"],
+        highlightbackground=c["accent"], font=("DejaVu Sans", 8, "bold"),
+        padx=10, pady=8, cursor="hand2",
+    )
+    next_step_button.pack(side="right", expand=True, fill="x", padx=(5, 0))
+
+    original_training_widgets = (
+        form_row, save_as_button, save_help, capture_motion, motion_help,
+        import_video_button, import_video_help, options_shell,
+        status_label_training, progress_label, buttons,
+    )
+
+    def _actualizar_tarjetas_tipo_entrenamiento(*_):
+        tipo = training_type_var.get()
+        for btn, value in ((static_type_button, "Estática"), (dynamic_type_button, "Movimiento")):
+            selected = tipo == value
+            btn.configure(
+                bg=c["accent"] if selected else c["button"],
+                fg=c["accent_text"] if selected else c["text"],
+                activebackground=c["accent_hover"] if selected else c["button_active"],
+                activeforeground=c["accent_text"] if selected else c["text"],
+                highlightbackground=c["accent"] if selected else c["border"],
+            )
+        if tipo == "Movimiento":
+            type_help_var.set(
+                "Para señas con trayectoria usa Capturar movimiento o importa un video corto. El reconocedor dinámico existente no se modifica."
+            )
+        else:
+            type_help_var.set(
+                "Para letras o poses usa una muestra, un lote o captura continua. También puedes importar video; la lógica existente decidirá el formato real."
+            )
+
+    static_type_button.configure(command=lambda: training_type_var.set("Estática"))
+    dynamic_type_button.configure(command=lambda: training_type_var.set("Movimiento"))
+    training_type_var.trace_add("write", _actualizar_tarjetas_tipo_entrenamiento)
+
+    def _actualizar_calidad_entrenamiento(*_):
+        nombre = sign_name_var.get().strip().upper()
+        data = cargar_dataset(nombre) if nombre else {"samples": []}
+        samples = data.get("samples", []) if isinstance(data, dict) else []
+        total = len(samples)
+        dinamicas = sum(
+            1 for sample in samples
+            if isinstance(sample, dict)
+            and (str(sample.get("type", "")).lower() == "dynamic" or isinstance(sample.get("frames"), list))
+        )
+        con_cara = sum(1 for sample in samples if isinstance(sample, dict) and sample.get("face"))
+        if total <= 0:
+            calidad = "— Sin muestras"
+            color = c["muted"]
+            test_model_button.configure(state="disabled")
+        elif total < 15:
+            calidad = "● Pocas muestras"
+            color = c["danger"]
+            test_model_button.configure(state="normal")
+        elif total < 40:
+            calidad = "● En progreso"
+            color = "#D6A84B"
+            test_model_button.configure(state="normal")
+        else:
+            calidad = "● Buena cantidad"
+            color = c["ok"]
+            test_model_button.configure(state="normal")
+        detalles = [f"{total} muestra(s)"]
+        if dinamicas:
+            detalles.append(f"{dinamicas} dinámica(s)")
+        if con_cara:
+            detalles.append(f"{con_cara} con rostro")
+        quality_var.set(f"{calidad}  ·  " + "  ·  ".join(detalles))
+        quality_label.configure(fg=color)
+
+    def _actualizar_pipeline_video(*_):
+        valor = str(progress_var.get() or "")
+        low = valor.lower()
+        if "procesando video" in low:
+            porcentaje = 0
+            try:
+                porcentaje = int("".join(ch for ch in valor.split(":", 1)[-1] if ch.isdigit()) or 0)
+            except Exception:
+                porcentaje = 0
+            if porcentaje < 25:
+                video_pipeline_var.set("Video ✓  →  detectando manos…  →  secuencia  →  variaciones  →  modelo")
+            elif porcentaje < 65:
+                video_pipeline_var.set("Video ✓  →  manos ✓  →  validando secuencia…  →  variaciones  →  modelo")
+            elif porcentaje < 99:
+                video_pipeline_var.set("Video ✓  →  manos ✓  →  secuencia ✓  →  generando variaciones…  →  modelo")
+            else:
+                video_pipeline_var.set("Video ✓  →  manos ✓  →  secuencia ✓  →  variaciones ✓  →  guardando…")
+        elif "video guardado" in low or "modelo" in low and "listo" in str(status_var.get()).lower():
+            video_pipeline_var.set("Video ✓  →  manos ✓  →  secuencia ✓  →  variaciones ✓  →  modelo listo ✓")
+        _actualizar_calidad_entrenamiento()
+
+    progress_var.trace_add("write", _actualizar_pipeline_video)
+    samples_var.trace_add("write", _actualizar_calidad_entrenamiento)
+
+    def _toggle_advanced_training():
+        training_advanced_visible.set(not training_advanced_visible.get())
+        if training_advanced_visible.get():
+            options_shell.pack(fill="x", pady=(0, 8), before=status_label_training)
+            advanced_toggle_button.configure(text="⚙  Ocultar opciones avanzadas")
+        else:
+            options_shell.pack_forget()
+            advanced_toggle_button.configure(text="⚙  Opciones avanzadas")
+
+    advanced_toggle_button.configure(command=_toggle_advanced_training)
+
+    def _probar_modelo_entrenado():
+        nombre = sign_name_var.get().strip().upper()
+        data = cargar_dataset(nombre) if nombre else {"samples": []}
+        if not data.get("samples"):
+            status_var.set("Primero captura o importa al menos una muestra.")
+            return
+        cerrar_entrenamiento()
+        set_sidebar_active("Traducir")
+        set_status(f"Modelo {nombre} listo para probar. Realiza la seña frente a la cámara.")
+        if "mostrar_toast" in globals():
+            mostrar_toast(f"Modelo {nombre} listo para probar", "ok")
+
+    test_model_button.configure(command=_probar_modelo_entrenado)
+
+    def _mostrar_paso_entrenamiento(paso):
+        paso = max(1, min(3, int(paso)))
+        training_step_var.set(paso)
+        for widget in original_training_widgets:
+            try:
+                widget.pack_forget()
+            except tk.TclError:
+                pass
+        for widget in (type_shell, capture_stage_title, capture_stage_help,
+                       advanced_toggle_button, video_pipeline, review_shell,
+                       test_model_button, wizard_nav):
+            try:
+                widget.pack_forget()
+            except tk.TclError:
+                pass
+
+        for i, lbl in enumerate(step_labels, start=1):
+            active = i == paso
+            lbl.configure(
+                bg=c["accent"] if active else c["button"],
+                fg=c["accent_text"] if active else c["muted"],
+                highlightbackground=c["accent"] if active else c["border"],
+            )
+
+        if paso == 1:
+            form_row.pack(fill="x", pady=(0, 10))
+            type_shell.pack(fill="x", pady=(0, 10))
+        elif paso == 2:
+            form_row.pack(fill="x", pady=(0, 8))
+            capture_stage_title.pack(fill="x", pady=(0, 4))
+            capture_stage_help.pack(fill="x", pady=(0, 8))
+            if training_type_var.get() == "Movimiento":
+                capture_motion.pack(fill="x", pady=(0, 5))
+                motion_help.pack(fill="x", pady=(0, 7))
+            else:
+                buttons.pack(fill="x", pady=(0, 4))
+            import_video_button.pack(fill="x", pady=(0, 5))
+            import_video_help.pack(fill="x", pady=(0, 7))
+            advanced_toggle_button.pack(fill="x", pady=(0, 7))
+            if training_advanced_visible.get():
+                options_shell.pack(fill="x", pady=(0, 8))
+            video_pipeline.pack(fill="x", pady=(0, 7))
+            status_label_training.pack(fill="x", pady=(0, 4))
+            progress_label.pack(fill="x", pady=(0, 7))
+        else:
+            form_row.pack(fill="x", pady=(0, 8))
+            review_shell.pack(fill="x", pady=(0, 9))
+            status_label_training.pack(fill="x", pady=(0, 4))
+            progress_label.pack(fill="x", pady=(0, 8))
+            save_as_button.pack(fill="x", pady=(0, 7))
+            save_help.pack(fill="x", pady=(0, 8))
+            test_model_button.pack(fill="x", pady=(0, 8))
+            _actualizar_calidad_entrenamiento()
+
+        back_step_button.configure(state="normal" if paso > 1 else "disabled")
+        next_step_button.configure(
+            text="Finalizar" if paso == 3 else "Siguiente →",
+            state="normal",
+        )
+        wizard_nav.pack(fill="x", pady=(3, 0))
+
+    def _ir_paso_anterior():
+        _mostrar_paso_entrenamiento(training_step_var.get() - 1)
+
+    def _ir_paso_siguiente():
+        actual = training_step_var.get()
+        if actual == 1 and not sign_name_var.get().strip():
+            status_var.set("Primero escribe el nombre de la seña.")
+            return
+        if actual >= 3:
+            _probar_modelo_entrenado()
+        else:
+            _mostrar_paso_entrenamiento(actual + 1)
+
+    back_step_button.configure(command=_ir_paso_anterior)
+    next_step_button.configure(command=_ir_paso_siguiente)
+
+    def _shortcut_training_space(event=None):
+        try:
+            focus = win.focus_get()
+            if isinstance(focus, (tk.Entry, ttk.Combobox)):
+                return None
+        except Exception:
+            pass
+        if training_step_var.get() != 2:
+            return "break"
+        if training_type_var.get() == "Movimiento":
+            capturar_movimiento()
+        else:
+            capturar_lote()
+        return "break"
+
+    win.bind("<space>", _shortcut_training_space)
+    _actualizar_tarjetas_tipo_entrenamiento()
+    _actualizar_calidad_entrenamiento()
+    _mostrar_paso_entrenamiento(1)
+
 
     def cerrar_entrenamiento():
         global face_training_requested
+        # Si hay un video en proceso, el worker se detiene sin tocar Tkinter.
+        video_training_state["cancelled"] = True
+        video_after = video_training_state.get("after_id")
+        if video_after:
+            try:
+                win.after_cancel(video_after)
+            except tk.TclError:
+                pass
+            video_training_state["after_id"] = None
         # Si había una serie en curso, guarda lo ya capturado antes de cerrar.
         if capture_job["running"]:
             terminar_captura(cancelado=True)
@@ -6268,11 +8413,76 @@ account_open_button = register_theme(
 account_open_button.pack(fill="x", padx=18, pady=(0, 16))
 
 # ---------------- PANEL FLOTANTE DE AJUSTES ----------------
+# Contenedor con scroll real: evita que los botones inferiores desaparezcan
+# cuando Configuración tiene más contenido que la altura disponible.
+# SOLO afecta la interfaz; no toca reconocimiento, cámara ni modelos.
+settings_viewport = tk.Frame(root, bd=0, highlightthickness=0)
+settings_canvas = tk.Canvas(
+    settings_viewport,
+    bd=0,
+    highlightthickness=0,
+)
+settings_scrollbar = tk.Scrollbar(
+    settings_viewport,
+    orient="vertical",
+    command=settings_canvas.yview,
+)
+settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+settings_scrollbar.pack(side="right", fill="y")
+settings_canvas.pack(side="left", fill="both", expand=True)
+
 settings_panel = tk.Frame(
-    root,
+    settings_canvas,
     highlightthickness=1,
     bd=0,
 )
+_settings_canvas_window = settings_canvas.create_window(
+    (0, 0),
+    window=settings_panel,
+    anchor="nw",
+)
+
+def _refresh_settings_scrollregion(event=None):
+    try:
+        settings_canvas.configure(scrollregion=settings_canvas.bbox("all"))
+    except tk.TclError:
+        pass
+
+def _fit_settings_width(event):
+    try:
+        settings_canvas.itemconfigure(_settings_canvas_window, width=max(1, event.width))
+        root.after_idle(_refresh_settings_scrollregion)
+    except tk.TclError:
+        pass
+
+def _scroll_settings(event):
+    try:
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta:
+            step = -1 if delta > 0 else 1
+        else:
+            number = int(getattr(event, "num", 0) or 0)
+            step = -1 if number == 4 else 1 if number == 5 else 0
+        if step:
+            settings_canvas.yview_scroll(step * 3, "units")
+            return "break"
+    except (tk.TclError, ValueError, TypeError):
+        pass
+
+def _enable_settings_wheel(event=None):
+    root.bind_all("<MouseWheel>", _scroll_settings)
+    root.bind_all("<Button-4>", _scroll_settings)
+    root.bind_all("<Button-5>", _scroll_settings)
+
+def _disable_settings_wheel(event=None):
+    root.unbind_all("<MouseWheel>")
+    root.unbind_all("<Button-4>")
+    root.unbind_all("<Button-5>")
+
+settings_panel.bind("<Configure>", _refresh_settings_scrollregion)
+settings_canvas.bind("<Configure>", _fit_settings_width)
+settings_viewport.bind("<Enter>", _enable_settings_wheel)
+settings_viewport.bind("<Leave>", _disable_settings_wheel)
 
 appearance_label = tk.Label(
     settings_panel,
@@ -6353,6 +8563,48 @@ for option in ("OFF", "Baja", "Media"):
     btn.bind("<Enter>", _stab_enter)
     btn.bind("<Leave>", _stab_leave)
 
+# ---------------- RENDIMIENTO / BAJA LATENCIA ----------------
+performance_separator = tk.Frame(settings_panel, height=1)
+performance_separator.pack(fill="x", padx=16, pady=(0, 14))
+
+performance_label = tk.Label(
+    settings_panel,
+    text="RENDIMIENTO",
+    anchor="w",
+    font=("DejaVu Sans", 8, "bold"),
+)
+performance_label.pack(fill="x", padx=16, pady=(0, 7))
+
+performance_options = tk.Frame(settings_panel)
+performance_options.pack(fill="x", padx=16, pady=(0, 6))
+
+turbo_mode_check = tk.Checkbutton(
+    performance_options,
+    text="Modo Turbo · menor latencia",
+    variable=turbo_mode_var,
+    command=actualizar_modo_turbo,
+    anchor="w",
+    font=("DejaVu Sans", 9, "bold"),
+    cursor="hand2",
+    bd=0,
+    highlightthickness=0,
+)
+turbo_mode_check.pack(fill="x")
+
+performance_help = tk.Label(
+    settings_panel,
+    text=(
+        "Analiza la cámara en vivo a 480×270, pide hasta 60 FPS y evita "
+        "Face Mesh cuando solo serviría para dibujar puntos. Los modelos y "
+        "el entrenamiento conservan su configuración original."
+    ),
+    anchor="w",
+    justify="left",
+    wraplength=360,
+    font=("DejaVu Sans", 8),
+)
+performance_help.pack(fill="x", padx=16, pady=(0, 14))
+
 # ---------------- VISUALIZACIÓN DE LANDMARKS ----------------
 landmarks_separator = tk.Frame(settings_panel, height=1)
 landmarks_separator.pack(fill="x", padx=16, pady=(0, 14))
@@ -6396,9 +8648,13 @@ show_face_points_check.pack(fill="x")
 
 landmarks_help = tk.Label(
     settings_panel,
-    text="Estas opciones solo cambian lo que ves en la cámara; no desactivan la detección.",
+    text=(
+        "Estas opciones cambian lo que ves en cámara. En Modo Turbo, los puntos "
+        "faciales se procesan solo cuando una seña/modelo necesita rostro o durante entrenamiento."
+    ),
     anchor="w",
     justify="left",
+    wraplength=360,
     font=("DejaVu Sans", 8),
 )
 landmarks_help.pack(fill="x", padx=16, pady=(0, 14))
@@ -6800,7 +9056,7 @@ def draw_sidebar_icon(canvas, kind, active=False):
     """Dibuja iconos sencillos para evitar depender de emojis/fuentes."""
     c = THEMES.get(current_theme_name, THEMES["Oscuro"])
     canvas.delete("all")
-    color = "#FFFFFF" if active else ("#27AFFF" if current_theme_name == "Oscuro" else "#087AC1")
+    color = "#FFFFFF" if active else ("#B7BBC2" if current_theme_name == "Oscuro" else "#555555")
     canvas.configure(bg=c["accent"] if active else c["panel"], highlightthickness=0)
 
     if kind == "home":
@@ -6836,9 +9092,58 @@ def draw_sidebar_icon(canvas, kind, active=False):
         canvas.create_oval(9,5,17,13, outline=color, width=1.5)
         canvas.create_arc(5,12,21,24, start=20, extent=140, style=tk.ARC, outline=color, width=1.5)
 
+def _reiniciar_estado_temporal_traductor():
+    """Evita que una detección a medias pase de una pestaña a otra."""
+    globals()["sentence_candidate"] = None
+    globals()["sentence_candidate_since"] = 0.0
+    globals()["sentence_candidate_confirmations"] = 0
+    globals()["sentence_candidate_confidence_sum"] = 0.0
+    globals()["sentence_candidate_last_frame_id"] = -1
+    globals()["sentence_last_committed_sign"] = None
+    globals()["sentence_no_hand_since"] = None
+
+    dynamic_recognition_buffer.clear()
+    globals()["dynamic_recognition_tick"] = 0
+    globals()["dynamic_last_result"] = (None, 0.0)
+
+    globals()["recognition_display_sign"] = None
+    globals()["recognition_display_confidence"] = 0.0
+    globals()["recognition_display_time"] = 0.0
+
+    with lock:
+        globals()["latest_recognized_sign"] = None
+        globals()["latest_recognition_confidence"] = 0.0
+
+
+def _colocar_capa_contenido(panel):
+    """Cubre cámara + panel derecho sin cambiar el grid del dashboard."""
+    root.update_idletasks()
+    x = camera_panel.winfo_x()
+    y = min(camera_panel.winfo_y(), side_panel.winfo_y())
+    right = side_panel.winfo_x() + side_panel.winfo_width()
+    bottom = max(
+        camera_panel.winfo_y() + camera_panel.winfo_height(),
+        side_panel.winfo_y() + side_panel.winfo_height(),
+    )
+    panel.place(
+        x=x,
+        y=y,
+        width=max(1, right - x),
+        height=max(1, bottom - y),
+    )
+    panel.lift()
+
+
 def set_sidebar_active(name):
     global sidebar_active
+    anterior = sidebar_active
     sidebar_active = name
+
+    # El traductor tiene ciclo de vida propio. Al entrar o salir reiniciamos
+    # solo su estado temporal; la oración ya formada NO se borra.
+    if anterior != name and (anterior == "Traducir" or name == "Traducir"):
+        _reiniciar_estado_temporal_traductor()
+
     update_sidebar_style()
 
     # Configuración ahora tiene su propia vista. Al cambiar a cualquier otra
@@ -6858,28 +9163,29 @@ def set_sidebar_active(name):
         history_side_blank_panel.place_forget()
     if "history_combined_blank_panel" in globals():
         history_combined_blank_panel.place_forget()
+    if "home_blank_panel" in globals():
+        home_blank_panel.place_forget()
     if "text_to_sign_panel" in globals():
         text_to_sign_panel.place_forget()
 
-    # Al pulsar "Inicio", ocultamos COMPLETAMENTE el panel del lado derecho
-    # y dejamos que la cámara use todo el espacio liberado.
-    # No se modifica la lógica de captura ni MediaPipe.
+    # Inicio es una vista propia y deliberadamente vacía. Conservamos el grid
+    # de contenido y lo cubrimos con UN solo recuadro; la cámara/traductor
+    # quedan detrás, sin clasificar señas ni producir voz/historial.
     if name == "Inicio":
         camera_panel.grid(row=0, column=1, sticky="nsew", padx=6)
-        side_panel.grid_remove()
-
-        # Quitamos el reparto uniforme mientras el panel derecho está oculto.
-        # Así la columna de la cámara puede crecer de verdad.
+        side_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
         main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
-        main.grid_columnconfigure(1, weight=1, uniform="")
-        main.grid_columnconfigure(2, weight=0, minsize=0, uniform="")
+        main.grid_columnconfigure(1, weight=6, uniform="main_content")
+        main.grid_columnconfigure(2, weight=3, minsize=0, uniform="main_content")
 
-        # Recalculamos el área real de video después de que Tkinter
-        # haya expandido la columna central.
-        root.update_idletasks()
-        actualizar_dimensiones_video()
-        root.after(40, actualizar_dimensiones_video)
-        root.after(120, actualizar_dimensiones_video)
+        if "home_blank_panel" in globals():
+            _colocar_capa_contenido(home_blank_panel)
+            refrescar_inicio_dashboard()
+            # Al arrancar maximizado Tkinter puede terminar de calcular el tamaño
+            # unos milisegundos después; recolocamos sin mostrar nada intermedio.
+            root.after(50, lambda: _colocar_capa_contenido(home_blank_panel) if sidebar_active == "Inicio" else None)
+            root.after(60, lambda: refrescar_inicio_dashboard() if sidebar_active == "Inicio" else None)
+            root.after(150, lambda: _colocar_capa_contenido(home_blank_panel) if sidebar_active == "Inicio" else None)
 
     elif name == "Traducir":
         camera_panel.grid(row=0, column=1, sticky="nsew", padx=6)
@@ -6931,7 +9237,7 @@ def set_sidebar_active(name):
     elif name == "Historial":
         # Conservamos EXACTAMENTE los mismos paneles y el mismo grid que Traducir.
         # En vez de sustituirlos (lo que hacía recalcular alturas), ponemos una
-        # capa azul vacía encima de cada uno. El layout no cambia ni un píxel.
+        # capa vacía encima de cada uno. El layout no cambia ni un píxel.
         camera_panel.grid(row=0, column=1, sticky="nsew", padx=6)
         side_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
 
@@ -6939,23 +9245,9 @@ def set_sidebar_active(name):
         main.grid_columnconfigure(1, weight=6, uniform="main_content")
         main.grid_columnconfigure(2, weight=3, minsize=0, uniform="main_content")
 
-        # Un único rectángulo vacío cubre cámara + panel derecho.
-        # Se usa place() sobre main para NO tocar el grid ni sus proporciones.
-        root.update_idletasks()
-        x = camera_panel.winfo_x()
-        y = min(camera_panel.winfo_y(), side_panel.winfo_y())
-        right = side_panel.winfo_x() + side_panel.winfo_width()
-        bottom = max(
-            camera_panel.winfo_y() + camera_panel.winfo_height(),
-            side_panel.winfo_y() + side_panel.winfo_height(),
-        )
-        history_combined_blank_panel.place(
-            x=x,
-            y=y,
-            width=max(1, right - x),
-            height=max(1, bottom - y),
-        )
-        history_combined_blank_panel.lift()
+        # Historial también es una vista independiente: ocupa el área de
+        # contenido completa sin reutilizar visualmente Traducir.
+        _colocar_capa_contenido(history_combined_blank_panel)
         if "refrescar_historial_ui" in globals():
             refrescar_historial_ui()
 
@@ -6987,28 +9279,34 @@ def sidebar_enter(name):
 def sidebar_leave(name):
     update_sidebar_style()
 
-menu_items = [
-    # (nombre interno, texto visible, icono, altura)
-    ("Inicio", "Inicio", "home", 38),
-    ("Traducir", "Señas a texto", "hand", 38),
-    (
-        "Comunicar con señas",
-        "Texto a señas",
-        "chat",
-        38,
-    ),
-    ("Historial", "Historial", "history", 38),
-    ("Configuración", "Configuración", "gear", 38),
-    ("Cuenta", "Cuenta", "account", 38),
-]
+# Navegación dividida en dos grupos para que las funciones principales
+# destaquen y los ajustes no compitan visualmente con ellas.
 
-for menu_name, menu_text, menu_icon, menu_height in menu_items:
+def _crear_titulo_sidebar(texto, top_pad=8):
+    titulo = register_theme(
+        tk.Label(
+            sidebar_nav,
+            text=texto,
+            anchor="w",
+            font=("DejaVu Sans", 7, "bold"),
+        ),
+        "muted_panel",
+    )
+    titulo.pack(fill="x", padx=9, pady=(top_pad, 4))
+    return titulo
+
+
+def _crear_item_sidebar(menu_name, menu_text, menu_icon, menu_height=38):
     item = tk.Frame(sidebar_nav, height=menu_height, cursor="hand2")
     item.pack(fill="x", pady=2)
     item.pack_propagate(False)
 
-    icon_canvas = tk.Canvas(item, width=26, height=26, bd=0, highlightthickness=0, cursor="hand2")
-    icon_canvas.pack(side="left", padx=(8, 7), pady=max(4, (menu_height - 26) // 2))
+    icon_canvas = tk.Canvas(
+        item, width=26, height=26, bd=0, highlightthickness=0, cursor="hand2"
+    )
+    icon_canvas.pack(
+        side="left", padx=(8, 7), pady=max(4, (menu_height - 26) // 2)
+    )
 
     item_label = tk.Label(
         item,
@@ -7022,11 +9320,72 @@ for menu_name, menu_text, menu_icon, menu_height in menu_items:
 
     sidebar_buttons[menu_name] = (item, icon_canvas, item_label, menu_icon)
 
-    # Solo selección visual. No se conectan comandos nuevos a la lógica existente.
+    # Se conservan exactamente las mismas acciones internas.
     for widget in (item, icon_canvas, item_label):
         widget.bind("<Button-1>", lambda event, n=menu_name: set_sidebar_active(n))
         widget.bind("<Enter>", lambda event, n=menu_name: sidebar_enter(n))
         widget.bind("<Leave>", lambda event, n=menu_name: sidebar_leave(n))
+
+    return item
+
+
+sidebar_main_title = _crear_titulo_sidebar("PRINCIPAL", top_pad=2)
+
+for menu_name, menu_text, menu_icon in (
+    ("Inicio", "Inicio", "home"),
+    ("Traducir", "Señas a texto", "hand"),
+    ("Comunicar con señas", "Texto a señas", "chat"),
+    ("Historial", "Historial", "history"),
+):
+    _crear_item_sidebar(menu_name, menu_text, menu_icon)
+
+sidebar_section_separator = register_theme(
+    tk.Frame(sidebar_nav, height=1, bd=0, highlightthickness=0),
+    "panel_alt",
+)
+sidebar_section_separator.pack(fill="x", padx=8, pady=(10, 4))
+
+sidebar_app_title = _crear_titulo_sidebar("APLICACIÓN", top_pad=3)
+
+for menu_name, menu_text, menu_icon in (
+    ("Configuración", "Configuración", "gear"),
+    # Se conserva el nombre interno "Cuenta" para no tocar su lógica;
+    # visualmente funciona como información general de la aplicación.
+    ("Cuenta", "Acerca de", "account"),
+):
+    _crear_item_sidebar(menu_name, menu_text, menu_icon)
+
+# ----------------------------------------------------------
+# ESTADO DE MODELOS · DEBAJO DE LA NAVEGACIÓN
+# ----------------------------------------------------------
+# Solo cambia la ubicación visual del indicador. La cola, descarga,
+# validación y carga de modelos en RAM conservan exactamente la misma lógica.
+model_sync_frame = register_theme(
+    tk.Frame(sidebar_nav, highlightthickness=1, bd=0),
+    "panel",
+)
+model_sync_frame.pack(fill="x", padx=4, pady=(10, 2))
+
+model_sync_label = tk.Label(
+    model_sync_frame,
+    text="Modelos: preparando...",
+    font=("DejaVu Sans", 8, "bold"),
+    anchor="w",
+    justify="left",
+    wraplength=205,
+)
+model_sync_label.pack(fill="x", padx=8, pady=(7, 5))
+
+model_sync_progress = ttk.Progressbar(
+    model_sync_frame,
+    style="ModelSync.Horizontal.TProgressbar",
+    orient="horizontal",
+    mode="determinate",
+    maximum=100,
+    value=0,
+    length=205,
+)
+model_sync_progress.pack(fill="x", padx=8, pady=(0, 8))
 
 # Icono de mano embebido para la marca inferior del menú lateral.
 # No necesita un archivo PNG externo al ejecutar la aplicación.
@@ -7197,8 +9556,9 @@ def add_button_hover(button, role="button"):
         c = THEMES.get(current_theme_name, THEMES["Oscuro"])
         if str(button.cget("state")) != "disabled":
             button.configure(
-                bg=c["button_active"] if role == "button" else c["button_active"],
+                bg=c["accent_hover"] if role == "primary_button" else c["button_active"],
                 highlightbackground=c["accent"],
+                highlightcolor=c["accent"],
             )
 
     def on_leave(event=None):
@@ -7206,12 +9566,14 @@ def add_button_hover(button, role="button"):
         if role == "primary_button":
             button.configure(
                 bg=c["accent"],
-                highlightbackground=c["border"],
+                highlightbackground=c["accent"],
+                highlightcolor=c["accent"],
             )
         else:
             button.configure(
                 bg=c["button"],
                 highlightbackground=c["border"],
+                highlightcolor=c["accent"],
             )
 
     button.bind("<Enter>", on_enter, add="+")
@@ -7317,6 +9679,390 @@ history_combined_blank_panel = register_theme(
     "panel",
 )
 history_combined_blank_panel.place_forget()
+
+# Inicio: ahora funciona como una portada real de la aplicación.
+# Conserva la independencia visual respecto al traductor, pero añade accesos
+# directos, resumen del sistema y una explicación breve del proyecto.
+home_blank_panel = register_theme(
+    tk.Frame(main, highlightthickness=1),
+    "panel",
+)
+home_blank_panel.place_forget()
+
+# ---------------- INICIO / PORTADA ----------------
+def abrir_inicio_traductor():
+    """Abre la vista principal de señas a texto e inicia la cámara si hace falta."""
+    set_sidebar_active("Traducir")
+
+    if not globals().get("running", False):
+        if not globals().get("camera_items"):
+            actualizar_camaras()
+
+        if globals().get("camera_items"):
+            try:
+                if camera_combo.current() < 0:
+                    camera_combo.current(0)
+            except Exception:
+                pass
+            iniciar_camara()
+        else:
+            set_status("No se encontró ninguna cámara disponible.", error=True)
+            return
+
+    set_status("Traductor listo para usar.")
+
+
+def abrir_inicio_texto_a_senas():
+    """Abre la vista Texto a señas y enfoca el campo de entrada."""
+    set_sidebar_active("Comunicar con señas")
+    try:
+        texto_senas_entry.focus_set()
+    except Exception:
+        pass
+    set_status("Escribe una palabra o frase para convertirla a señas.")
+
+
+def abrir_inicio_entrenamiento():
+    """Abre rápidamente la ventana de entrenamiento de modelos."""
+    set_sidebar_active("Configuración")
+    abrir_ventana_entrenamiento()
+    set_status("Ventana de entrenamiento abierta.")
+
+
+def refrescar_inicio_dashboard():
+    """Actualiza el resumen del estado mostrado en la portada."""
+    if "home_camera_value" not in globals():
+        return
+
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+
+    # ---------------- CÁMARA ----------------
+    cams = globals().get("camera_items", []) or []
+    total_cams = len(cams)
+    selected_name = ""
+    try:
+        selected_index = camera_combo.current()
+    except Exception:
+        selected_index = -1
+
+    if 0 <= selected_index < total_cams:
+        selected_name = str(cams[selected_index].get("dispositivo", "Cámara"))
+    elif total_cams > 0:
+        selected_name = str(cams[0].get("dispositivo", "Cámara"))
+
+    cap_obj = globals().get("cap")
+    camera_running = bool(globals().get("running", False)) and cap_obj is not None
+
+    if camera_running:
+        home_camera_value.configure(text="Activa", fg=c["ok"])
+        home_camera_detail.configure(
+            text=(selected_name or "Cámara en uso") + " · lista para reconocer"
+        )
+    elif total_cams > 0:
+        home_camera_value.configure(text=f"{total_cams} disponible(s)", fg=c["text"])
+        detalle_camara = (
+            f"Lista para iniciar · {selected_name}"
+            if selected_name
+            else "Lista para iniciar"
+        )
+        home_camera_detail.configure(text=detalle_camara)
+    else:
+        home_camera_value.configure(text="Sin cámara", fg=c["danger"])
+        home_camera_detail.configure(text="Pulsa refrescar cámaras para buscar dispositivos")
+
+    # ---------------- MODELOS ----------------
+    labels = sorted({
+        str(item.get("label", "")).strip().upper()
+        for item in globals().get("recognition_model_samples", [])
+        if isinstance(item, dict) and str(item.get("label", "")).strip()
+    })
+    sample_count = len(globals().get("recognition_model_samples", []))
+
+    if labels:
+        home_models_value.configure(text=f"{len(labels)} seña(s)", fg=c["ok"])
+        home_models_detail.configure(
+            text=f"{sample_count} muestra(s) activas cargadas en RAM"
+        )
+    else:
+        home_models_value.configure(text="Sin modelos", fg=c["danger"])
+        home_models_detail.configure(text="Carga o entrena un modelo para comenzar")
+
+    # ---------------- SISTEMA ----------------
+    model_state = str(globals().get("model_sync_visual_state", "idle") or "idle").lower()
+    rostro_txt = "manos + rostro" if FACE_MESH_AVAILABLE else "solo manos"
+
+    if model_state == "ready":
+        home_system_value.configure(text="Todo listo", fg=c["ok"])
+        home_system_detail.configure(text=f"Reconocimiento local en RAM · {rostro_txt}")
+    elif model_state in ("connected", "validated", "processing", "downloading", "verifying"):
+        home_system_value.configure(text="Preparando", fg=c["text"])
+        home_system_detail.configure(text=f"Sincronizando modelos · {rostro_txt}")
+    elif model_state == "offline":
+        home_system_value.configure(text="Modo local", fg=c["ok"])
+        home_system_detail.configure(text=f"Sin internet · usando caché local · {rostro_txt}")
+    elif model_state == "error":
+        home_system_value.configure(text="Revisar", fg=c["danger"])
+        home_system_detail.configure(text="Hubo un problema al validar o cargar modelos")
+    else:
+        home_system_value.configure(text="En espera", fg=c["text"])
+        home_system_detail.configure(text=f"Abre una función para empezar · {rostro_txt}")
+
+    # ---------------- MENSAJE PRINCIPAL ----------------
+    if not labels:
+        hero_text = "Carga o entrena un modelo para comenzar a traducir señas."
+        hero_color = c["danger"]
+    elif total_cams <= 0:
+        hero_text = "Conecta una cámara para usar el reconocimiento en tiempo real."
+        hero_color = c["danger"]
+    elif camera_running:
+        hero_text = "Todo listo: ya puedes mostrar una seña frente a la cámara."
+        hero_color = c["ok"]
+    else:
+        hero_text = "Todo listo: entra a Señas a texto para iniciar la cámara y traducir."
+        hero_color = c["ok"]
+
+    home_hero_status.configure(text=hero_text, fg=hero_color)
+
+
+def programar_actualizacion_inicio_dashboard():
+    """Mantiene fresca la portada sin tocar la lógica del traductor."""
+    try:
+        refrescar_inicio_dashboard()
+        root.after(900, programar_actualizacion_inicio_dashboard)
+    except Exception:
+        pass
+
+
+home_content = register_theme(tk.Frame(home_blank_panel), "panel")
+home_content.pack(fill="both", expand=True, padx=22, pady=22)
+
+home_hero_card = register_theme(
+    tk.Frame(home_content, highlightthickness=1),
+    "card",
+)
+home_hero_card.pack(fill="x", pady=(0, 14))
+
+home_tag = register_theme(
+    tk.Label(
+        home_hero_card,
+        text="INICIO",
+        font=(FONT, 8, "bold"),
+        anchor="w",
+    ),
+    "muted_card",
+)
+home_tag.pack(fill="x", padx=18, pady=(16, 6))
+
+home_title = register_theme(
+    tk.Label(
+        home_hero_card,
+        text="Manos que Hablan",
+        font=(FONT, 22, "bold"),
+        anchor="w",
+    ),
+    "text_card",
+)
+home_title.pack(fill="x", padx=18)
+
+home_subtitle = register_theme(
+    tk.Label(
+        home_hero_card,
+        text=(
+            "Sistema de traducción de lengua de señas en tiempo real por visión artificial."
+        ),
+        font=(FONT, 10),
+        anchor="w",
+        justify="left",
+        wraplength=980,
+    ),
+    "muted_card",
+)
+home_subtitle.pack(fill="x", padx=18, pady=(6, 8))
+
+home_hero_status = register_theme(
+    tk.Label(
+        home_hero_card,
+        text="Preparando sistema...",
+        font=(FONT, 9, "bold"),
+        anchor="w",
+        justify="left",
+        wraplength=980,
+    ),
+    "text_card",
+)
+home_hero_status.pack(fill="x", padx=18, pady=(0, 10))
+
+home_features = register_theme(tk.Frame(home_hero_card), "card")
+home_features.pack(fill="x", padx=18, pady=(0, 12))
+
+for feature_text in (
+    "• Reconocimiento de señas en tiempo real",
+    "• Conversión de texto a señas",
+    "• Entrenamiento de modelos desde cámara o video",
+):
+    register_theme(
+        tk.Label(
+            home_features,
+            text=feature_text,
+            font=(FONT, 9),
+            anchor="w",
+            justify="left",
+        ),
+        "text_card",
+    ).pack(fill="x", pady=2)
+
+home_actions = register_theme(tk.Frame(home_hero_card), "card")
+home_actions.pack(fill="x", padx=18, pady=(2, 18))
+home_actions.grid_columnconfigure(0, weight=1, uniform="home_action")
+home_actions.grid_columnconfigure(1, weight=1, uniform="home_action")
+home_actions.grid_columnconfigure(2, weight=1, uniform="home_action")
+
+home_translate_button = register_theme(
+    tk.Button(
+        home_actions,
+        text="Señas a texto",
+        command=abrir_inicio_traductor,
+        relief="flat",
+        bd=0,
+        padx=16,
+        pady=14,
+        cursor="hand2",
+        font=(FONT, 10, "bold"),
+    ),
+    "primary_button",
+)
+home_translate_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+add_button_hover(home_translate_button, "primary_button")
+
+home_text_button = register_theme(
+    tk.Button(
+        home_actions,
+        text="Texto a señas",
+        command=abrir_inicio_texto_a_senas,
+        relief="flat",
+        bd=0,
+        padx=16,
+        pady=14,
+        cursor="hand2",
+        font=(FONT, 10, "bold"),
+    ),
+    "button",
+)
+home_text_button.grid(row=0, column=1, sticky="ew", padx=6)
+add_button_hover(home_text_button, "button")
+
+home_training_button = register_theme(
+    tk.Button(
+        home_actions,
+        text="Entrenar modelo",
+        command=abrir_inicio_entrenamiento,
+        relief="flat",
+        bd=0,
+        padx=16,
+        pady=14,
+        cursor="hand2",
+        font=(FONT, 10, "bold"),
+    ),
+    "button",
+)
+home_training_button.grid(row=0, column=2, sticky="ew", padx=(6, 0))
+add_button_hover(home_training_button, "button")
+
+home_metrics = register_theme(tk.Frame(home_content), "panel")
+home_metrics.pack(fill="x", pady=(0, 14))
+home_metrics.grid_columnconfigure(0, weight=1, uniform="home_metric")
+home_metrics.grid_columnconfigure(1, weight=1, uniform="home_metric")
+home_metrics.grid_columnconfigure(2, weight=1, uniform="home_metric")
+
+
+def _crear_tarjeta_inicio(parent, column, title_text):
+    card = register_theme(
+        tk.Frame(parent, highlightthickness=1),
+        "card",
+    )
+    card.grid(row=0, column=column, sticky="nsew", padx=(0, 7) if column == 0 else ((7, 7) if column == 1 else (7, 0)))
+
+    title = register_theme(
+        tk.Label(
+            card,
+            text=title_text,
+            font=(FONT, 8, "bold"),
+            anchor="w",
+        ),
+        "muted_card",
+    )
+    title.pack(fill="x", padx=14, pady=(14, 6))
+
+    value = register_theme(
+        tk.Label(
+            card,
+            text="--",
+            font=(FONT, 16, "bold"),
+            anchor="w",
+        ),
+        "text_card",
+    )
+    value.pack(fill="x", padx=14)
+
+    detail = register_theme(
+        tk.Label(
+            card,
+            text="",
+            font=(FONT, 8),
+            anchor="w",
+            justify="left",
+            wraplength=250,
+        ),
+        "muted_card",
+    )
+    detail.pack(fill="x", padx=14, pady=(5, 14))
+
+    return card, value, detail
+
+
+home_camera_card, home_camera_value, home_camera_detail = _crear_tarjeta_inicio(
+    home_metrics, 0, "CÁMARA"
+)
+home_models_card, home_models_value, home_models_detail = _crear_tarjeta_inicio(
+    home_metrics, 1, "MODELOS"
+)
+home_system_card, home_system_value, home_system_detail = _crear_tarjeta_inicio(
+    home_metrics, 2, "SISTEMA"
+)
+
+home_steps_card = register_theme(
+    tk.Frame(home_content, highlightthickness=1),
+    "card",
+)
+home_steps_card.pack(fill="both", expand=True)
+
+home_steps_title = register_theme(
+    tk.Label(
+        home_steps_card,
+        text="CÓMO EMPEZAR",
+        font=(FONT, 8, "bold"),
+        anchor="w",
+    ),
+    "muted_card",
+)
+home_steps_title.pack(fill="x", padx=18, pady=(16, 8))
+
+for step_text in (
+    "1. Entra a Señas a texto para iniciar la cámara y reconocer señas en vivo.",
+    "2. Usa Texto a señas para mostrar cómo se formarían palabras o frases.",
+    "3. Si te falta una seña, entra a Entrenar modelo y crea tu propio conjunto.",
+):
+    register_theme(
+        tk.Label(
+            home_steps_card,
+            text=step_text,
+            font=(FONT, 9),
+            anchor="w",
+            justify="left",
+            wraplength=980,
+        ),
+        "text_card",
+    ).pack(fill="x", padx=18, pady=4)
 
 # Contenido real del Historial. La capa sigue usando place() para conservar
 # exactamente el tamaño original de cámara + panel derecho.
@@ -8645,20 +11391,28 @@ activity_canvas.pack(fill="x", padx=12, pady=(0, 8))
 register_theme(activity_canvas, "card")
 
 # ---------------- PANEL DE TRADUCCIÓN REDISEÑADO ----------------
-# Solo cambia la interfaz del panel derecho. La cámara y MediaPipe siguen intactos.
+# Mejora visual de la vista "Señas a texto".
+# IMPORTANTE: se conservan los mismos widgets/variables que ya usa la lógica
+# (translation_value, translation_status_value y translation_confidence_value).
+# Solo cambia su presentación en pantalla.
 
 features_panel = register_theme(tk.Frame(side_panel), "panel")
 features_panel.pack(fill="both", expand=True, padx=12, pady=(4, 12))
 
-# Encabezado del modo Traducir.
+# Encabezado más limpio y con jerarquía clara.
 translate_header = register_theme(tk.Frame(features_panel), "panel")
-translate_header.pack(fill="x", pady=(2, 10))
+translate_header.pack(fill="x", pady=(2, 12))
+
+translate_header.grid_columnconfigure(0, weight=1)
+
+translate_heading = register_theme(tk.Frame(translate_header), "panel")
+translate_heading.grid(row=0, column=0, sticky="w")
 
 translate_title = register_theme(
     tk.Label(
-        translate_header,
-        text="TRADUCCIÓN",
-        font=("DejaVu Sans", 15, "bold"),
+        translate_heading,
+        text="Señas a texto",
+        font=("DejaVu Sans", 16, "bold"),
         anchor="w",
     ),
     "text_panel",
@@ -8667,8 +11421,8 @@ translate_title.pack(anchor="w")
 
 translate_subtitle = register_theme(
     tk.Label(
-        translate_header,
-        text="La seña reconocida aparecerá aquí.",
+        translate_heading,
+        text="Reconocimiento en tiempo real mediante visión artificial.",
         font=("DejaVu Sans", 8),
         anchor="w",
     ),
@@ -8676,85 +11430,175 @@ translate_subtitle = register_theme(
 )
 translate_subtitle.pack(anchor="w", pady=(3, 0))
 
-# Tarjeta principal: reutiliza translation_value para no alterar la lógica existente.
+translate_mode_badge = register_theme(
+    tk.Label(
+        translate_header,
+        text="VISIÓN ARTIFICIAL",
+        font=("DejaVu Sans", 7, "bold"),
+        padx=8,
+        pady=5,
+    ),
+    "button",
+)
+translate_mode_badge.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+# ------------------------------------------------------------------
+# RESULTADO PRINCIPAL
+# Reutiliza translation_card y translation_value: la lógica no cambia.
+# ------------------------------------------------------------------
 translation_card.pack(fill="x", pady=(0, 10))
 
 translation_card_label = register_theme(
     tk.Label(
         translation_card,
-        text="RESULTADO",
+        text="SEÑA RECONOCIDA",
         font=("DejaVu Sans", 8, "bold"),
-        anchor="w",
+        anchor="center",
     ),
     "muted_card",
 )
-translation_card_label.pack(fill="x", padx=14, pady=(13, 4))
+translation_card_label.pack(fill="x", padx=16, pady=(15, 5))
 
 translation_value.configure(
-    justify="left",
-    anchor="w",
+    justify="center",
+    anchor="center",
     wraplength=330,
-    font=("DejaVu Sans", 20, "bold"),
+    font=("DejaVu Sans", 28, "bold"),
 )
-translation_value.pack(fill="x", padx=14, pady=(4, 16))
+translation_value.pack(fill="x", padx=16, pady=(8, 18))
 
-# Estado / confianza. Por ahora no se inventa un porcentaje: queda en -- hasta
-# que el modelo de reconocimiento entregue una confianza real.
+# ------------------------------------------------------------------
+# ESTADO + CONFIANZA
+# Visualmente compacto. Los textos siguen siendo actualizados por actualizar_video().
+# ------------------------------------------------------------------
 translation_info = register_theme(
     tk.Frame(features_panel, highlightthickness=1),
     "card",
 )
 translation_info.pack(fill="x", pady=(0, 10))
 
-translation_info_top = register_theme(tk.Frame(translation_info), "card")
-translation_info_top.pack(fill="x", padx=12, pady=(11, 4))
+translation_status_row = register_theme(tk.Frame(translation_info), "card")
+translation_status_row.pack(fill="x", padx=12, pady=(11, 8))
+translation_status_row.grid_columnconfigure(1, weight=1)
 
-translation_status_title = register_theme(
-    tk.Label(
-        translation_info_top,
-        text="Estado de detección",
-        font=("DejaVu Sans", 8, "bold"),
-        anchor="w",
-    ),
-    "text_card",
+translation_status_dot = tk.Canvas(
+    translation_status_row,
+    width=14,
+    height=14,
+    bd=0,
+    highlightthickness=0,
 )
-translation_status_title.pack(side="left")
+register_theme(translation_status_dot, "card")
+translation_status_dot.grid(row=0, column=0, sticky="w", padx=(0, 7))
 
 translation_status_value = register_theme(
     tk.Label(
-        translation_info_top,
+        translation_status_row,
         text="En espera",
-        font=("DejaVu Sans", 8, "bold"),
-        anchor="e",
-    ),
-    "muted_card",
-)
-translation_status_value.pack(side="right")
-
-translation_confidence_row = register_theme(tk.Frame(translation_info), "card")
-translation_confidence_row.pack(fill="x", padx=12, pady=(3, 11))
-
-translation_confidence_title = register_theme(
-    tk.Label(
-        translation_confidence_row,
-        text="Confianza del reconocimiento",
-        font=("DejaVu Sans", 8),
+        font=("DejaVu Sans", 9, "bold"),
         anchor="w",
     ),
     "muted_card",
 )
-translation_confidence_title.pack(side="left")
+translation_status_value.grid(row=0, column=1, sticky="w")
+
+translation_confidence_title = register_theme(
+    tk.Label(
+        translation_status_row,
+        text="Confianza",
+        font=("DejaVu Sans", 8),
+        anchor="e",
+    ),
+    "muted_card",
+)
+translation_confidence_title.grid(row=0, column=2, sticky="e", padx=(8, 6))
 
 translation_confidence_value = register_theme(
     tk.Label(
-        translation_confidence_row,
+        translation_status_row,
         text="--",
-        font=("DejaVu Sans", 9, "bold"),
+        font=("DejaVu Sans", 10, "bold"),
         anchor="e",
+        width=5,
     ),
     "text_card",
 )
-translation_confidence_value.pack(side="right")
+translation_confidence_value.grid(row=0, column=3, sticky="e")
+
+# Barra puramente visual: lee el porcentaje que ya muestra la interfaz.
+# No participa en el reconocimiento ni modifica ninguna confianza.
+translation_confidence_canvas = tk.Canvas(
+    translation_info,
+    height=7,
+    bd=0,
+    highlightthickness=0,
+)
+register_theme(translation_confidence_canvas, "card")
+translation_confidence_canvas.pack(fill="x", padx=12, pady=(0, 11))
+
+
+def actualizar_indicador_traduccion_visual():
+    """Pinta estado y barra leyendo únicamente los textos actuales de la UI."""
+    try:
+        c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+        estado = str(translation_status_value.cget("text") or "").strip().lower()
+        confianza_txt = str(translation_confidence_value.cget("text") or "").strip()
+
+        if "reconoc" in estado:
+            dot_color = c["ok"]
+        elif "modelo no" in estado or "error" in estado:
+            dot_color = c["danger"]
+        else:
+            dot_color = c["muted"]
+
+        translation_status_dot.configure(bg=c["card"])
+        translation_status_dot.delete("all")
+        translation_status_dot.create_oval(
+            3, 3, 11, 11,
+            fill=dot_color,
+            outline="",
+        )
+
+        porcentaje = 0.0
+        if confianza_txt.endswith("%"):
+            try:
+                porcentaje = float(confianza_txt[:-1].strip())
+            except (TypeError, ValueError):
+                porcentaje = 0.0
+        porcentaje = max(0.0, min(100.0, porcentaje))
+
+        translation_confidence_canvas.configure(bg=c["card"])
+        translation_confidence_canvas.delete("all")
+        translation_confidence_canvas.update_idletasks()
+        ancho = max(1, translation_confidence_canvas.winfo_width())
+        alto = max(1, translation_confidence_canvas.winfo_height())
+        cy = alto / 2
+
+        translation_confidence_canvas.create_rectangle(
+            0,
+            max(0, cy - 2),
+            ancho,
+            min(alto, cy + 2),
+            fill=c["button"],
+            outline="",
+        )
+
+        if porcentaje > 0:
+            translation_confidence_canvas.create_rectangle(
+                0,
+                max(0, cy - 2),
+                ancho * (porcentaje / 100.0),
+                min(alto, cy + 2),
+                fill=c["accent"],
+                outline="",
+            )
+
+        root.after(120, actualizar_indicador_traduccion_visual)
+    except (tk.TclError, NameError):
+        pass
+
+
+root.after(150, actualizar_indicador_traduccion_visual)
 
 # Las antiguas acciones rápidas Copiar / Escuchar / Limpiar se mantienen
 # internamente por compatibilidad, pero ya no se muestran en la interfaz.
@@ -8852,6 +11696,10 @@ sentence_candidate = None
 sentence_candidate_since = 0.0
 sentence_candidate_confirmations = 0
 sentence_candidate_confidence_sum = 0.0
+# ID del último frame REAL de MediaPipe contado para el candidato actual.
+# La UI puede refrescar varias veces entre dos resultados de MediaPipe; sin
+# este control, una misma predicción podía contar como varias confirmaciones.
+sentence_candidate_last_frame_id = -1
 sentence_last_committed_sign = None
 sentence_no_hand_since = None
 
@@ -8882,14 +11730,21 @@ sentence_last_spoken_text = None
 sentence_last_spoken_time = 0.0
 AUTO_SPEECH_REPEAT_GUARD_SECONDS = 0.75
 
-# Filtro conservador para formar frases:
-# - exige una seña estable durante un poco más de tiempo;
-# - exige varias confirmaciones consecutivas;
-# - exige una confianza mínima antes de aceptar la palabra.
-SENTENCE_STABLE_SECONDS = 0.60
-SENTENCE_RELEASE_SECONDS = 0.45
+# Filtro rápido para palabras completas. Se conserva prácticamente igual para
+# que la traducción normal siga respondiendo al instante.
+SENTENCE_STABLE_SECONDS = 0.05
+SENTENCE_RELEASE_SECONDS = 0.22
 SENTENCE_MIN_CONFIDENCE = 72.0
-SENTENCE_MIN_CONFIRMATIONS = 5
+SENTENCE_MIN_CONFIRMATIONS = 2
+
+# Filtro exclusivo para LETRAS del abecedario.
+# Al cambiar de una letra a otra, la mano atraviesa posturas intermedias que el
+# clasificador puede reconocer durante unos pocos frames como otras letras.
+# Este pequeño candado solo retrasa la ESCRITURA de la letra, no MediaPipe ni
+# la vista de cámara. Evita A -> [C,D,F] -> B al mover la mano rápidamente.
+LETTER_STABLE_SECONDS = 0.13
+LETTER_MIN_CONFIRMATIONS = 4
+LETTER_MIN_CONFIDENCE = 76.0
 
 sentence_card = register_theme(
     tk.Frame(features_panel, highlightthickness=1),
@@ -9028,6 +11883,7 @@ def borrar_ultima_sena_oracion():
     global sentence_candidate_since
     global sentence_candidate_confirmations
     global sentence_candidate_confidence_sum
+    global sentence_candidate_last_frame_id
     global sentence_last_committed_sign
     global sentence_no_hand_since
     global sentence_letter_buffer
@@ -9042,6 +11898,7 @@ def borrar_ultima_sena_oracion():
         sentence_candidate_since = 0.0
         sentence_candidate_confirmations = 0
         sentence_candidate_confidence_sum = 0.0
+        sentence_candidate_last_frame_id = -1
         sentence_last_committed_sign = None
         sentence_no_hand_since = None
         _refrescar_texto_oracion()
@@ -9057,6 +11914,7 @@ def borrar_ultima_sena_oracion():
     sentence_candidate_since = 0.0
     sentence_candidate_confirmations = 0
     sentence_candidate_confidence_sum = 0.0
+    sentence_candidate_last_frame_id = -1
     sentence_last_committed_sign = None
     sentence_no_hand_since = None
     _refrescar_texto_oracion()
@@ -9070,6 +11928,7 @@ def limpiar_oracion():
     global sentence_candidate_since
     global sentence_candidate_confirmations
     global sentence_candidate_confidence_sum
+    global sentence_candidate_last_frame_id
     global sentence_last_committed_sign
     global sentence_no_hand_since
     global sentence_history_id
@@ -9087,6 +11946,7 @@ def limpiar_oracion():
     sentence_candidate_since = 0.0
     sentence_candidate_confirmations = 0
     sentence_candidate_confidence_sum = 0.0
+    sentence_candidate_last_frame_id = -1
     sentence_last_committed_sign = None
     sentence_no_hand_since = None
     _refrescar_texto_oracion()
@@ -9109,23 +11969,83 @@ def leer_oracion_en_voz_alta():
     set_status("Leyendo la oración en voz alta...")
 
 
-# Acciones del constructor de oraciones: mismo ancho y alineación.
-sentence_actions = register_theme(tk.Frame(sentence_card), "card")
-sentence_actions.pack(fill="x", padx=14, pady=(0, 8))
+# Barra compacta de acciones de la oración.
+# Solo cambia la presentación: los cuatro comandos conservan su lógica original.
+sentence_actions_shell = register_theme(
+    tk.Frame(sentence_card, highlightthickness=1),
+    "panel_alt",
+)
+sentence_actions_shell.pack(fill="x", padx=14, pady=(0, 12))
+
+sentence_actions_header = register_theme(
+    tk.Frame(sentence_actions_shell),
+    "panel_alt",
+)
+sentence_actions_header.pack(fill="x", padx=10, pady=(8, 5))
+
+sentence_actions_title = register_theme(
+    tk.Label(
+        sentence_actions_header,
+        text="ACCIONES RÁPIDAS",
+        font=(FONT, 7, "bold"),
+        anchor="w",
+    ),
+    "muted_panel",
+)
+sentence_actions_title.pack(side="left")
+
+sentence_actions_hint = register_theme(
+    tk.Label(
+        sentence_actions_header,
+        text="Oración actual",
+        font=(FONT, 7),
+        anchor="e",
+    ),
+    "muted_panel",
+)
+sentence_actions_hint.pack(side="right")
+
+sentence_actions = register_theme(tk.Frame(sentence_actions_shell), "panel_alt")
+sentence_actions.pack(fill="x", padx=8, pady=(0, 8))
 for col in range(4):
     sentence_actions.grid_columnconfigure(col, weight=1, uniform="sentence_action")
 
-sentence_copy_button = make_translate_action(
-    sentence_actions, "⧉  Copiar", copiar_oracion, 0
+def _make_sentence_action(text, command, column, primary=False):
+    role = "primary_button" if primary else "button"
+    btn = register_theme(
+        tk.Button(
+            sentence_actions,
+            text=text,
+            command=command,
+            relief="flat",
+            bd=0,
+            padx=5,
+            pady=6,
+            cursor="hand2",
+            font=(FONT, 8, "bold"),
+        ),
+        role,
+    )
+    btn.grid(
+        row=0,
+        column=column,
+        sticky="ew",
+        padx=(0, 3) if column == 0 else ((3, 3) if column < 3 else (3, 0)),
+    )
+    add_button_hover(btn, role)
+    return btn
+
+sentence_copy_button = _make_sentence_action(
+    "⧉  Copiar", copiar_oracion, 0
 )
-sentence_delete_button = make_translate_action(
-    sentence_actions, "⌫  Borrar", borrar_ultima_sena_oracion, 1
+sentence_delete_button = _make_sentence_action(
+    "⌫  Borrar", borrar_ultima_sena_oracion, 1
 )
-sentence_clear_button = make_translate_action(
-    sentence_actions, "×  Limpiar", limpiar_oracion, 2
+sentence_clear_button = _make_sentence_action(
+    "×  Limpiar", limpiar_oracion, 2
 )
-sentence_read_button = make_translate_action(
-    sentence_actions, "🔊  Leer", leer_oracion_en_voz_alta, 3
+sentence_read_button = _make_sentence_action(
+    "▶  Escuchar", leer_oracion_en_voz_alta, 3, primary=True
 )
 
 
@@ -9140,6 +12060,11 @@ def _hablar_sena_en_segundo_plano(texto):
     global sentence_tts_missing_notified
     global sentence_last_spoken_text
     global sentence_last_spoken_time
+
+    # La voz automática pertenece exclusivamente a la pestaña Traducir.
+    # Esto protege también llamadas futuras que pudieran hacerse desde otro sitio.
+    if globals().get("sidebar_active") != "Traducir":
+        return
 
     if not texto:
         return
@@ -9189,12 +12114,42 @@ def _hablar_sena_en_segundo_plano(texto):
     if not texto_voz:
         return
 
+    def _leer_config_piper(ruta_modelo):
+        """Lee el .onnx.json asociado a Piper sin fallar si no existe."""
+        try:
+            ruta_config = Path(str(ruta_modelo) + ".json")
+            if not ruta_config.exists():
+                return {}
+            with ruta_config.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _speaker_femenino_piper(ruta_modelo):
+        """Devuelve el speaker id femenino cuando el modelo Piper es multivoz."""
+        config = _leer_config_piper(ruta_modelo)
+        speaker_map = config.get("speaker_id_map")
+        if not isinstance(speaker_map, dict):
+            return None
+
+        # El modelo es_ES-sharvard-medium usa M=0 y F=1.
+        # También aceptamos nombres equivalentes por si se usa otra voz multihablante.
+        for nombre, speaker_id in speaker_map.items():
+            clave = str(nombre).strip().lower()
+            if clave in {"f", "female", "femenina", "mujer", "woman"} or "female" in clave:
+                try:
+                    return int(speaker_id)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     def _buscar_modelo_piper_es():
-        """Busca una voz Piper española en ubicaciones pequeñas y conocidas."""
+        """Busca la mejor voz Piper española, priorizando una voz femenina media/alta."""
         candidatos = []
         modelo_env = os.environ.get("MQH_PIPER_MODEL", "").strip()
         if modelo_env:
-            candidatos.append(Path(modelo_env).expanduser())
+            candidatos.append((Path(modelo_env).expanduser(), True))
 
         base_app = Path(__file__).resolve().parent
         carpetas = [
@@ -9207,22 +12162,56 @@ def _hablar_sena_en_segundo_plano(texto):
         for carpeta in carpetas:
             try:
                 if carpeta.exists():
-                    candidatos.extend(carpeta.rglob("*.onnx"))
+                    candidatos.extend((ruta, False) for ruta in carpeta.rglob("*.onnx"))
             except Exception:
                 pass
 
-        for ruta in candidatos:
+        mejor = None
+        mejor_puntaje = -1
+        vistos = set()
+        for ruta, es_env in candidatos:
             try:
+                ruta = Path(ruta)
+                clave_ruta = str(ruta.resolve())
+                if clave_ruta in vistos or not ruta.is_file():
+                    continue
+                vistos.add(clave_ruta)
+
                 nombre = ruta.name.lower()
-                if ruta.is_file() and (
+                if not (
                     nombre.startswith("es_")
                     or nombre.startswith("es-")
                     or "spanish" in nombre
                 ):
-                    return ruta
+                    continue
+
+                config = _leer_config_piper(ruta)
+                idioma = str((config.get("language") or {}).get("code", "")).lower()
+                if idioma and not idioma.startswith("es"):
+                    continue
+
+                puntaje = 0
+                if es_env:
+                    puntaje += 5000
+                if "sharvard" in nombre:
+                    puntaje += 1200
+                if "high" in nombre:
+                    puntaje += 350
+                elif "medium" in nombre:
+                    puntaje += 250
+                elif "low" in nombre:
+                    puntaje += 80
+
+                if _speaker_femenino_piper(ruta) is not None:
+                    puntaje += 1000
+
+                if puntaje > mejor_puntaje:
+                    mejor_puntaje = puntaje
+                    mejor = ruta
             except Exception:
-                pass
-        return None
+                continue
+
+        return mejor
 
     def worker():
         global sentence_tts_missing_notified
@@ -9231,45 +12220,107 @@ def _hablar_sena_en_segundo_plano(texto):
         hablado = False
         with sentence_speech_lock:
             try:
-                # Windows: elige una voz española instalada y ajusta el ritmo.
-                if os.name == "nt":
-                    powershell = shutil.which("powershell") or shutil.which("pwsh")
-                    if powershell:
-                        try:
-                            env = os.environ.copy()
-                            env["MQH_TTS_TEXT"] = texto_voz
-                            script = (
-                                "Add-Type -AssemblyName System.Speech; "
-                                "$v=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                                "$voices=@($v.GetInstalledVoices() | ForEach-Object {$_.VoiceInfo} | "
-                                "Where-Object {$_.Culture.Name -like 'es-*'}); "
-                                "if($voices.Count -gt 0){$v.SelectVoice($voices[0].Name)}; "
-                                "$v.Rate=-1; $v.Volume=100; "
-                                "$v.Speak($env:MQH_TTS_TEXT)"
-                            )
+                # ======================================================
+                # VOZ NEURAL PRINCIPAL · FEMENINA PERUANA
+                # ======================================================
+                # Edge TTS suena mucho más natural que eSpeak/System.Speech.
+                # Se ejecuta dentro de este hilo, así que Internet o el audio NO
+                # bloquean Tkinter, MediaPipe ni el reconocimiento de la cámara.
+                # Puede cambiarse sin tocar código con MQH_TTS_VOICE.
+                voz_neural = os.environ.get("MQH_TTS_VOICE", "es-PE-CamilaNeural").strip() or "es-PE-CamilaNeural"
+                edge_playback = shutil.which("edge-playback")
+                edge_tts_exe = shutil.which("edge-tts")
+
+                if not hablado and edge_playback:
+                    try:
+                        resultado = subprocess.run(
+                            [
+                                edge_playback,
+                                "--voice", voz_neural,
+                                "--rate=-4%",
+                                "--pitch=+0Hz",
+                                "--volume=+0%",
+                                "--text", texto_voz,
+                            ],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                            timeout=25,
+                        )
+                        hablado = resultado.returncode == 0
+                    except Exception:
+                        pass
+
+                # Si edge-playback no está o no tiene reproductor, generamos un MP3
+                # con edge-tts y usamos el reproductor disponible en el sistema.
+                if not hablado and edge_tts_exe:
+                    try:
+                        import tempfile
+                        with tempfile.TemporaryDirectory(prefix="mqh_neural_tts_") as td:
+                            mp3 = Path(td) / "voz_camila.mp3"
                             resultado = subprocess.run(
-                                [powershell, "-NoProfile", "-Command", script],
-                                env=env,
+                                [
+                                    edge_tts_exe,
+                                    "--voice", voz_neural,
+                                    "--rate=-4%",
+                                    "--pitch=+0Hz",
+                                    "--volume=+0%",
+                                    "--text", texto_voz,
+                                    "--write-media", str(mp3),
+                                ],
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL,
                                 check=False,
-                                timeout=20,
+                                timeout=25,
                             )
-                            hablado = resultado.returncode == 0
-                        except Exception:
-                            pass
+                            if resultado.returncode == 0 and mp3.exists() and mp3.stat().st_size > 0:
+                                if shutil.which("mpv"):
+                                    comando = ["mpv", "--no-video", "--really-quiet", str(mp3)]
+                                elif shutil.which("ffplay"):
+                                    comando = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(mp3)]
+                                elif shutil.which("cvlc"):
+                                    comando = ["cvlc", "--play-and-exit", "--quiet", str(mp3)]
+                                else:
+                                    comando = None
 
-                # Linux: si Piper y una voz española están instalados, se usan
-                # antes que eSpeak porque la voz es mucho más natural.
-                if not hablado and os.name != "nt" and shutil.which("piper"):
+                                if comando:
+                                    play = subprocess.run(
+                                        comando,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                        check=False,
+                                        timeout=25,
+                                    )
+                                    hablado = play.returncode == 0
+                    except Exception:
+                        pass
+
+                # ======================================================
+                # RESPALDO OFFLINE · PIPER FEMENINO
+                # ======================================================
+                # Si no hay Internet, preferimos Piper antes que voces robóticas.
+                # Para modelos multihablante se selecciona automáticamente la mujer.
+                piper_exe = shutil.which("piper")
+                if not hablado and piper_exe:
                     modelo_piper = _buscar_modelo_piper_es()
                     if modelo_piper is not None:
                         try:
                             import tempfile
                             with tempfile.TemporaryDirectory(prefix="mqh_tts_") as td:
                                 wav = Path(td) / "voz.wav"
+                                comando_piper = [
+                                    piper_exe,
+                                    "--model", str(modelo_piper),
+                                    "--length_scale", "1.03",
+                                    "--sentence_silence", "0.08",
+                                    "--output_file", str(wav),
+                                ]
+                                speaker_id = _speaker_femenino_piper(modelo_piper)
+                                if speaker_id is not None:
+                                    comando_piper.extend(["--speaker", str(speaker_id)])
+
                                 resultado = subprocess.run(
-                                    ["piper", "--model", str(modelo_piper), "--output_file", str(wav)],
+                                    comando_piper,
                                     input=texto_voz.encode("utf-8"),
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL,
@@ -9281,6 +12332,8 @@ def _hablar_sena_en_segundo_plano(texto):
                                         comando = ["paplay", str(wav)]
                                     elif shutil.which("aplay"):
                                         comando = ["aplay", "-q", str(wav)]
+                                    elif shutil.which("mpv"):
+                                        comando = ["mpv", "--no-video", "--really-quiet", str(wav)]
                                     elif shutil.which("ffplay"):
                                         comando = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(wav)]
                                     else:
@@ -9295,6 +12348,37 @@ def _hablar_sena_en_segundo_plano(texto):
                                             timeout=20,
                                         )
                                         hablado = play.returncode == 0
+                        except Exception:
+                            pass
+
+                # Windows local: solo si no funcionó la voz neural ni Piper.
+                if not hablado and os.name == "nt":
+                    powershell = shutil.which("powershell") or shutil.which("pwsh")
+                    if powershell:
+                        try:
+                            env = os.environ.copy()
+                            env["MQH_TTS_TEXT"] = texto_voz
+                            script = (
+                                "Add-Type -AssemblyName System.Speech; "
+                                "$v=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                                "$all=@($v.GetInstalledVoices() | ForEach-Object {$_.VoiceInfo}); "
+                                "$femaleEs=@($all | Where-Object {"
+                                "$_.Culture.Name -like 'es-*' -and $_.Gender.ToString() -eq 'Female'}); "
+                                "$spanish=@($all | Where-Object {$_.Culture.Name -like 'es-*'}); "
+                                "if($femaleEs.Count -gt 0){$v.SelectVoice($femaleEs[0].Name)} "
+                                "elseif($spanish.Count -gt 0){$v.SelectVoice($spanish[0].Name)}; "
+                                "$v.Rate=0; $v.Volume=100; "
+                                "$v.Speak($env:MQH_TTS_TEXT)"
+                            )
+                            resultado = subprocess.run(
+                                [powershell, "-NoProfile", "-Command", script],
+                                env=env,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                                timeout=20,
+                            )
+                            hablado = resultado.returncode == 0
                         except Exception:
                             pass
 
@@ -9314,8 +12398,11 @@ def _hablar_sena_en_segundo_plano(texto):
                 # Linux/Unix: Speech Dispatcher primero; eSpeak como respaldo.
                 if not hablado and shutil.which("spd-say"):
                     try:
+                        # female3 fuerza una variante femenina cuando Speech Dispatcher
+                        # la admite. Si el backend no la soporta, el bloque de respaldo
+                        # de eSpeak de abajo sigue disponible.
                         resultado = subprocess.run(
-                            ["spd-say", "--wait", "-l", "es", texto_voz],
+                            ["spd-say", "--wait", "-l", "es", "-t", "female3", texto_voz],
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                             check=False,
@@ -9330,8 +12417,10 @@ def _hablar_sena_en_segundo_plano(texto):
                         if not shutil.which(ejecutable):
                             continue
                         try:
+                            # Variante femenina de eSpeak. Un ritmo moderado y
+                            # pausas cortas la hacen menos metálica sin ralentizarla.
                             resultado = subprocess.run(
-                                [ejecutable, "-v", "es", "-s", "145", "-p", "48", "-g", "3", texto_voz],
+                                [ejecutable, "-v", "es+f3", "-s", "155", "-p", "52", "-g", "2", texto_voz],
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL,
                                 check=False,
@@ -9349,18 +12438,29 @@ def _hablar_sena_en_segundo_plano(texto):
                         import pyttsx3
                         motor = pyttsx3.init()
                         try:
-                            for voz in motor.getProperty("voices") or []:
+                            voces = list(motor.getProperty("voices") or [])
+                            mejor_voz = None
+                            mejor_puntaje = -1
+                            for voz in voces:
                                 datos = " ".join([
                                     str(getattr(voz, "id", "")),
                                     str(getattr(voz, "name", "")),
                                     str(getattr(voz, "languages", "")),
+                                    str(getattr(voz, "gender", "")),
                                 ]).lower()
-                                if "spanish" in datos or "es_" in datos or "es-" in datos:
-                                    motor.setProperty("voice", voz.id)
-                                    break
+                                puntaje = 0
+                                if "spanish" in datos or "es_" in datos or "es-" in datos or "español" in datos:
+                                    puntaje += 10
+                                if any(clave in datos for clave in ("female", "mujer", "femen", "sabina", "helena", "elvira", "zira")):
+                                    puntaje += 6
+                                if puntaje > mejor_puntaje:
+                                    mejor_puntaje = puntaje
+                                    mejor_voz = voz
+                            if mejor_voz is not None and mejor_puntaje > 0:
+                                motor.setProperty("voice", mejor_voz.id)
                         except Exception:
                             pass
-                        motor.setProperty("rate", 165)
+                        motor.setProperty("rate", 160)
                         motor.setProperty("volume", 1.0)
                         motor.say(texto_voz)
                         motor.runAndWait()
@@ -9379,7 +12479,7 @@ def _hablar_sena_en_segundo_plano(texto):
                     lambda: set_status(
                         "No se encontró un motor de voz disponible."
                         if os.name == "nt"
-                        else "No se encontró un motor de voz. En Arch instala: sudo pacman -S espeak-ng",
+                        else "Voz natural no disponible. Instala edge-tts + mpv o Piper; eSpeak queda como respaldo.",
                         error=True,
                     ),
                 )
@@ -9395,6 +12495,7 @@ def actualizar_oracion_detectada(signo=None, sin_manos=False, confidence=0.0):
     global sentence_candidate_since
     global sentence_candidate_confirmations
     global sentence_candidate_confidence_sum
+    global sentence_candidate_last_frame_id
     global sentence_last_committed_sign
     global sentence_no_hand_since
     global sentence_letter_buffer
@@ -9402,11 +12503,19 @@ def actualizar_oracion_detectada(signo=None, sin_manos=False, confidence=0.0):
 
     now = time.monotonic()
 
+    # Cada confirmación debe corresponder a un resultado NUEVO de MediaPipe, no
+    # a otro refresco de Tkinter mostrando exactamente el mismo frame procesado.
+    try:
+        frame_id_actual = int(latest_processed_frame_id)
+    except (TypeError, ValueError, NameError):
+        frame_id_actual = -1
+
     if sin_manos:
         sentence_candidate = None
         sentence_candidate_since = 0.0
         sentence_candidate_confirmations = 0
         sentence_candidate_confidence_sum = 0.0
+        sentence_candidate_last_frame_id = -1
         if sentence_no_hand_since is None:
             sentence_no_hand_since = now
         else:
@@ -9425,6 +12534,7 @@ def actualizar_oracion_detectada(signo=None, sin_manos=False, confidence=0.0):
         sentence_candidate_since = 0.0
         sentence_candidate_confirmations = 0
         sentence_candidate_confidence_sum = 0.0
+        sentence_candidate_last_frame_id = -1
         return
 
     signo = str(signo).strip()
@@ -9446,13 +12556,23 @@ def actualizar_oracion_detectada(signo=None, sin_manos=False, confidence=0.0):
         sentence_candidate_since = 0.0
         sentence_candidate_confirmations = 0
         sentence_candidate_confidence_sum = 0.0
+        sentence_candidate_last_frame_id = -1
         return
 
-    if confidence < SENTENCE_MIN_CONFIDENCE:
+    # Las letras necesitan un filtro un poco más firme que las palabras completas.
+    # Esto evita guardar como letras reales las posturas intermedias que aparecen
+    # mientras la mano viaja de una seña del abecedario a otra.
+    es_letra = _es_sena_letra(signo)
+    confianza_minima = LETTER_MIN_CONFIDENCE if es_letra else SENTENCE_MIN_CONFIDENCE
+    estabilidad_minima = LETTER_STABLE_SECONDS if es_letra else SENTENCE_STABLE_SECONDS
+    confirmaciones_minimas = LETTER_MIN_CONFIRMATIONS if es_letra else SENTENCE_MIN_CONFIRMATIONS
+
+    if confidence < confianza_minima:
         sentence_candidate = None
         sentence_candidate_since = 0.0
         sentence_candidate_confirmations = 0
         sentence_candidate_confidence_sum = 0.0
+        sentence_candidate_last_frame_id = -1
         return
 
     if signo != sentence_candidate:
@@ -9460,21 +12580,29 @@ def actualizar_oracion_detectada(signo=None, sin_manos=False, confidence=0.0):
         sentence_candidate_since = now
         sentence_candidate_confirmations = 1
         sentence_candidate_confidence_sum = confidence
+        sentence_candidate_last_frame_id = frame_id_actual
         return
 
+    # Si Tkinter vuelve a consultar antes de que MediaPipe entregue otro frame,
+    # no sumamos una confirmación falsa. El tiempo de estabilidad puede seguir
+    # corriendo, pero las confirmaciones provienen de frames distintos.
+    if frame_id_actual >= 0 and frame_id_actual == sentence_candidate_last_frame_id:
+        return
+
+    sentence_candidate_last_frame_id = frame_id_actual
     sentence_candidate_confirmations += 1
     sentence_candidate_confidence_sum += confidence
 
-    if now - sentence_candidate_since < SENTENCE_STABLE_SECONDS:
+    if now - sentence_candidate_since < estabilidad_minima:
         return
 
-    if sentence_candidate_confirmations < SENTENCE_MIN_CONFIRMATIONS:
+    if sentence_candidate_confirmations < confirmaciones_minimas:
         return
 
     promedio_confianza = (
         sentence_candidate_confidence_sum / max(1, sentence_candidate_confirmations)
     )
-    if promedio_confianza < SENTENCE_MIN_CONFIDENCE:
+    if promedio_confianza < confianza_minima:
         return
 
     if signo == sentence_last_committed_sign:
@@ -9486,6 +12614,7 @@ def actualizar_oracion_detectada(signo=None, sin_manos=False, confidence=0.0):
     sentence_candidate_since = 0.0
     sentence_candidate_confirmations = 0
     sentence_candidate_confidence_sum = 0.0
+    sentence_candidate_last_frame_id = -1
 
     if _es_sena_letra(signo):
         # Las letras se unen sin espacios.
@@ -9530,6 +12659,259 @@ translate_hint = register_theme(
     "muted_panel",
 )
 translate_hint.pack(fill="x", pady=(5, 0))
+
+
+# ==========================================================
+# MODO PRESENTACIÓN · SOLO INTERFAZ
+# ==========================================================
+# Este modo NO modifica MediaPipe, la cámara, el reconocimiento, los modelos,
+# el historial ni la formación de oraciones. Únicamente reorganiza/oculta
+# widgets existentes para mostrar una vista limpia durante una exposición.
+presentation_mode_active = False
+presentation_layout_state = {}
+
+
+def _presentacion_recalcular_video():
+    """Recalcula el espacio visible de la cámara tras cambiar el layout."""
+    try:
+        root.update_idletasks()
+        actualizar_dimensiones_video()
+        root.after(50, actualizar_dimensiones_video)
+        root.after(150, actualizar_dimensiones_video)
+    except Exception:
+        pass
+
+
+def activar_modo_presentacion(event=None):
+    """Muestra cámara + traducción + oración en una vista limpia para exponer."""
+    global presentation_mode_active
+
+    if presentation_mode_active:
+        return "break"
+
+    # Si estaba activo el modo F11 de solo video, se restaura primero para no
+    # mezclar dos disposiciones visuales diferentes.
+    if globals().get("video_fullscreen_active", False):
+        salir_video_fullscreen()
+
+    # El modo presentación pertenece a Señas a texto. Se usa la navegación
+    # existente; no se cambia ninguna función del traductor.
+    if globals().get("sidebar_active") != "Traducir":
+        set_sidebar_active("Traducir")
+
+    presentation_mode_active = True
+
+    # Ocultar elementos de navegación y diagnóstico visual.
+    topbar.pack_forget()
+    footer.pack_forget()
+    left_panel.grid_remove()
+
+    camera_panel.grid_remove()
+    side_panel.grid_remove()
+
+    # Dos columnas: cámara protagonista + resultado/oración.
+    main.grid_columnconfigure(0, weight=7, minsize=0, uniform="presentation")
+    main.grid_columnconfigure(1, weight=3, minsize=0, uniform="presentation")
+    main.grid_columnconfigure(2, weight=0, minsize=0, uniform="")
+
+    camera_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+    side_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+
+    # En la cámara quedan únicamente imagen + landmarks ya existentes.
+    camera_header.pack_forget()
+    controls.pack_forget()
+
+    camera_container.pack_forget()
+    camera_container.pack(fill="both", expand=True, padx=0, pady=0)
+
+    camera_image_frame.pack_forget()
+    camera_image_frame.pack(fill="both", expand=True, padx=4, pady=4)
+
+    # En el panel de traducción dejamos solo lo necesario para presentar.
+    translate_header.pack_forget()
+    translation_info.pack_forget()
+    spell_live_row.pack_forget()
+    sentence_actions_shell.pack_forget()
+    translate_hint.pack_forget()
+
+    presentation_bar.pack(fill="x", pady=(0, 10), before=translation_card)
+
+    # Más legible a distancia. Solo se modifica apariencia de los mismos labels.
+    translation_card_label.configure(text="TRADUCCIÓN EN TIEMPO REAL")
+    translation_value.configure(
+        font=("DejaVu Sans", 38, "bold"),
+        wraplength=430,
+        padx=4,
+        pady=8,
+    )
+    sentence_title.configure(text="ORACIÓN")
+    sentence_value.configure(
+        font=("DejaVu Sans", 18, "bold"),
+        wraplength=430,
+    )
+
+    try:
+        presentation_button.configure(text="Salir de presentación")
+    except Exception:
+        pass
+
+    set_status("Modo presentación activado. Pulsa Esc o F10 para salir.")
+    _presentacion_recalcular_video()
+    return "break"
+
+
+def salir_modo_presentacion(event=None):
+    """Restaura exactamente la distribución normal de la vista Traducir."""
+    global presentation_mode_active
+
+    if not presentation_mode_active:
+        return None
+
+    presentation_mode_active = False
+
+    presentation_bar.pack_forget()
+
+    # Restaurar encabezados, confianza y controles de oración en su orden normal.
+    translate_header.pack(fill="x", pady=(2, 12), before=translation_card)
+    translation_info.pack(fill="x", pady=(0, 10), after=translation_card)
+
+    try:
+        spell_live_row.pack(fill="x", padx=14, pady=(0, 9), before=sentence_actions_shell)
+    except tk.TclError:
+        spell_live_row.pack(fill="x", padx=14, pady=(0, 9))
+
+    sentence_actions_shell.pack(fill="x", padx=14, pady=(0, 12))
+    translate_hint.pack(fill="x", pady=(5, 0))
+
+    translation_card_label.configure(text="SEÑA RECONOCIDA")
+    translation_value.configure(
+        font=("DejaVu Sans", 28, "bold"),
+        wraplength=330,
+        padx=0,
+        pady=0,
+    )
+    sentence_title.configure(text="FORMAR ORACIONES")
+    sentence_value.configure(
+        font=("DejaVu Sans", 13, "bold"),
+        wraplength=330,
+    )
+
+    # Restaurar el dashboard de tres columnas.
+    camera_panel.grid_remove()
+    side_panel.grid_remove()
+
+    main.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_FIXED_WIDTH, uniform="")
+    main.grid_columnconfigure(1, weight=6, minsize=0, uniform="main_content")
+    main.grid_columnconfigure(2, weight=3, minsize=0, uniform="main_content")
+
+    left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+    camera_panel.grid(row=0, column=1, sticky="nsew", padx=6)
+    side_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+
+    camera_header.pack(fill="x", padx=14, pady=(12, 8), before=camera_container)
+
+    camera_container.pack_forget()
+    camera_container.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+
+    camera_image_frame.pack_forget()
+    camera_image_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+    controls.pack(fill="x", padx=14, pady=(0, 8))
+
+    topbar.pack(fill="x", padx=0, pady=0, before=main)
+    footer.pack(fill="x")
+
+    try:
+        presentation_button.configure(text="Presentar")
+    except Exception:
+        pass
+
+    set_status("Modo presentación cerrado.")
+    _presentacion_recalcular_video()
+    return "break"
+
+
+def toggle_modo_presentacion(event=None):
+    if presentation_mode_active:
+        return salir_modo_presentacion(event)
+    return activar_modo_presentacion(event)
+
+
+def salir_modos_visuales(event=None):
+    """Esc sale primero de Presentación y, si no, del modo F11 de video."""
+    if presentation_mode_active:
+        return salir_modo_presentacion(event)
+    if globals().get("video_fullscreen_active", False):
+        return salir_video_fullscreen(event)
+    return None
+
+
+# Barra mínima visible únicamente mientras se presenta.
+presentation_bar = register_theme(
+    tk.Frame(features_panel, highlightthickness=1),
+    "panel",
+)
+
+presentation_bar_left = register_theme(tk.Frame(presentation_bar), "panel")
+presentation_bar_left.pack(side="left", fill="x", expand=True, padx=10, pady=8)
+
+presentation_mode_label = register_theme(
+    tk.Label(
+        presentation_bar_left,
+        text="MODO PRESENTACIÓN",
+        font=(FONT, 8, "bold"),
+        anchor="w",
+    ),
+    "text_panel",
+)
+presentation_mode_label.pack(anchor="w")
+
+presentation_mode_hint = register_theme(
+    tk.Label(
+        presentation_bar_left,
+        text="Cámara · traducción · oración",
+        font=(FONT, 7),
+        anchor="w",
+    ),
+    "muted_panel",
+)
+presentation_mode_hint.pack(anchor="w", pady=(2, 0))
+
+presentation_exit_button = register_theme(
+    tk.Button(
+        presentation_bar,
+        text="Salir  Esc",
+        command=salir_modo_presentacion,
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=7,
+        cursor="hand2",
+        font=(FONT, 8, "bold"),
+    ),
+    "button",
+)
+presentation_exit_button.pack(side="right", padx=8, pady=8)
+add_button_hover(presentation_exit_button, "button")
+presentation_bar.pack_forget()
+
+# Acceso permanente desde la barra superior. F10 hace lo mismo.
+presentation_button = register_theme(
+    tk.Button(
+        header_controls,
+        text="Presentar",
+        command=toggle_modo_presentacion,
+        relief="flat",
+        bd=0,
+        padx=11,
+        pady=8,
+        cursor="hand2",
+        font=(FONT, 8, "bold"),
+    ),
+    "button",
+)
+presentation_button.pack(side="left", padx=(0, 6), before=notification_button)
+add_button_hover(presentation_button, "button")
 
 
 def update_features_panel_theme():
@@ -9817,6 +13199,1147 @@ def bloquear_ancho_paneles():
     camera_container.pack_propagate(False)
 
 
+# ==========================================================
+# MEJORAS UX 11–24 · CAPA DE INTERFAZ / ORGANIZACIÓN
+# ==========================================================
+# Este bloque se apoya únicamente en estados y funciones ya existentes. No
+# modifica MediaPipe, extracción de landmarks, reconocimiento, entrenamiento,
+# umbrales, procesamiento de frames ni estructuras de los modelos.
+
+# ---------------- PREFERENCIAS VISUALES PERSISTENTES ----------------
+UI_PREFERENCES_FILE = HISTORY_DIR / "preferencias_ui.json"
+_ui_preferences = {}
+
+
+def _cargar_preferencias_ui():
+    global _ui_preferences
+    try:
+        if UI_PREFERENCES_FILE.exists():
+            with UI_PREFERENCES_FILE.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            _ui_preferences = data if isinstance(data, dict) else {}
+        else:
+            _ui_preferences = {}
+    except Exception:
+        _ui_preferences = {}
+    return _ui_preferences
+
+
+def _guardar_preferencias_ui(*_):
+    try:
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        data = dict(_ui_preferences)
+        data.update({
+            "tema": str(theme_var.get()),
+            "estabilizacion": str(stabilization_var.get()),
+            "modo_turbo": bool(turbo_mode_var.get()),
+            "mostrar_manos": bool(show_hand_points_var.get()),
+            "mostrar_rostro": bool(show_face_points_var.get()),
+            "guia_colocacion": bool(globals().get("placement_guide_var").get()) if globals().get("placement_guide_var") is not None else False,
+            "usar_modelos_servidor": bool(globals().get("use_server_models_var").get()) if globals().get("use_server_models_var") is not None else bool(SERVER_MODEL_SYNC_ENABLED),
+            "camara": str(camera_combo.get()) if "camera_combo" in globals() else "",
+        })
+        temporal = UI_PREFERENCES_FILE.with_suffix(".json.part")
+        with temporal.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        temporal.replace(UI_PREFERENCES_FILE)
+        _ui_preferences.clear()
+        _ui_preferences.update(data)
+    except Exception:
+        pass
+
+
+_cargar_preferencias_ui()
+# Preferencia funcional: permite decidir si esta instalación consulta y utiliza
+# modelos de PythonAnywhere. No borra la caché ni los JSON locales.
+if "usar_modelos_servidor" in _ui_preferences:
+    SERVER_MODEL_SYNC_ENABLED = bool(_ui_preferences["usar_modelos_servidor"])
+use_server_models_var = tk.BooleanVar(value=bool(SERVER_MODEL_SYNC_ENABLED))
+
+if _ui_preferences.get("tema") in ("Sistema", "Oscuro", "Claro"):
+    theme_var.set(_ui_preferences["tema"])
+if _ui_preferences.get("estabilizacion") in ("OFF", "Baja", "Media"):
+    stabilization_var.set(_ui_preferences["estabilizacion"])
+if "modo_turbo" in _ui_preferences:
+    turbo_mode_var.set(bool(_ui_preferences["modo_turbo"]))
+actualizar_modo_turbo()
+if "mostrar_manos" in _ui_preferences:
+    show_hand_points_var.set(bool(_ui_preferences["mostrar_manos"]))
+if "mostrar_rostro" in _ui_preferences:
+    show_face_points_var.set(bool(_ui_preferences["mostrar_rostro"]))
+actualizar_visibilidad_landmarks()
+try:
+    set_stabilization_mode()
+except Exception:
+    pass
+
+for _pref_var in (theme_var, stabilization_var, turbo_mode_var, show_hand_points_var, show_face_points_var):
+    try:
+        _pref_var.trace_add("write", _guardar_preferencias_ui)
+    except Exception:
+        pass
+
+# Restaurar cámara elegida después de cada escaneo, sin cambiar cómo se busca.
+_actualizar_camaras_original_ui = actualizar_camaras
+
+def actualizar_camaras():
+    _actualizar_camaras_original_ui()
+    preferida = str(_ui_preferences.get("camara", "") or "")
+    valores = list(camera_combo.cget("values") or ())
+    if preferida and preferida in valores:
+        try:
+            camera_combo.current(valores.index(preferida))
+        except Exception:
+            pass
+    _guardar_preferencias_ui()
+
+try:
+    refresh_button.configure(command=actualizar_camaras)
+    camera_combo.bind("<<ComboboxSelected>>", _guardar_preferencias_ui, add="+")
+except Exception:
+    pass
+
+
+# ---------------- TOASTS DISCRETOS ----------------
+toast_window = None
+toast_after_id = None
+
+def mostrar_toast(texto, kind="ok"):
+    global toast_window, toast_after_id
+    try:
+        if toast_after_id is not None:
+            root.after_cancel(toast_after_id)
+    except Exception:
+        pass
+    try:
+        if toast_window is not None and toast_window.winfo_exists():
+            toast_window.destroy()
+    except Exception:
+        pass
+
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    toast_window = tk.Toplevel(root)
+    toast_window.overrideredirect(True)
+    toast_window.attributes("-topmost", True)
+    bg = c["card"]
+    fg = c["danger"] if kind == "error" else (c["accent"] if kind == "info" else c["ok"])
+    frame = tk.Frame(toast_window, bg=bg, highlightthickness=1, highlightbackground=c["border"])
+    frame.pack(fill="both", expand=True)
+    tk.Label(
+        frame, text=("✓  " if kind == "ok" else "⚠  " if kind == "error" else "•  ") + str(texto),
+        bg=bg, fg=fg, font=(FONT, 9, "bold"), padx=14, pady=10,
+    ).pack()
+    root.update_idletasks()
+    toast_window.update_idletasks()
+    x = root.winfo_rootx() + root.winfo_width() - toast_window.winfo_reqwidth() - 24
+    y = root.winfo_rooty() + root.winfo_height() - toast_window.winfo_reqheight() - 42
+    toast_window.geometry(f"+{max(0, x)}+{max(0, y)}")
+    toast_after_id = root.after(2200, lambda: toast_window.destroy() if toast_window and toast_window.winfo_exists() else None)
+
+
+# ---------------- CÁMARA: MANOS/ROSTRO + GUÍA DE COLOCACIÓN ----------------
+camera_detection_badge = tk.Label(
+    camera_image_frame,
+    text="✋ 0 manos",
+    font=(FONT, 8, "bold"),
+    padx=8, pady=5,
+    bd=0,
+)
+camera_detection_badge.place(x=12, y=12, anchor="nw")
+
+placement_guide_var = tk.BooleanVar(value=bool(_ui_preferences.get("guia_colocacion", False)))
+placement_guide_parts = []
+for _name in range(4):
+    _part = tk.Frame(camera_image_frame, bd=0, highlightthickness=0)
+    placement_guide_parts.append(_part)
+placement_guide_hint = tk.Label(
+    camera_image_frame,
+    text="Coloca manos y rostro dentro de esta zona",
+    font=(FONT, 8, "bold"), padx=8, pady=3,
+)
+
+def _pintar_guia_colocacion():
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    for part in placement_guide_parts:
+        part.configure(bg=c["accent"])
+    placement_guide_hint.configure(bg=c["button"], fg=c["text"])
+    camera_detection_badge.configure(bg=c["button"], fg=c["text"])
+
+
+def actualizar_guia_colocacion(*_):
+    _pintar_guia_colocacion()
+    for part in placement_guide_parts:
+        part.place_forget()
+    placement_guide_hint.place_forget()
+    if placement_guide_var.get():
+        # Solo cuatro líneas; el centro sigue siendo el video real.
+        placement_guide_parts[0].place(relx=.21, rely=.17, relwidth=.58, height=2)
+        placement_guide_parts[1].place(relx=.21, rely=.79, relwidth=.58, height=2)
+        placement_guide_parts[2].place(relx=.21, rely=.17, width=2, relheight=.62)
+        placement_guide_parts[3].place(relx=.79, rely=.17, width=2, relheight=.62)
+        placement_guide_hint.place(relx=.5, rely=.82, anchor="n")
+    _guardar_preferencias_ui()
+
+placement_guide_var.trace_add("write", actualizar_guia_colocacion)
+
+placement_guide_button = register_theme(
+    tk.Button(
+        controls,
+        text="Guía",
+        command=lambda: placement_guide_var.set(not placement_guide_var.get()),
+        relief="flat", bd=0, padx=10, pady=8, cursor="hand2",
+        font=(FONT, 8, "bold"),
+    ),
+    "button",
+)
+placement_guide_button.grid(row=0, column=4, padx=(4, 0))
+add_button_hover(placement_guide_button, "button")
+
+
+def actualizar_badge_deteccion_camara():
+    try:
+        with lock:
+            hc = int(latest_hand_count or 0)
+        rostro = _cara_actual_reciente() is not None
+        if hc >= 2:
+            manos = "✋✋ 2 manos"
+        elif hc == 1:
+            manos = "✋ 1 mano"
+        else:
+            manos = "✋ 0 manos"
+        camera_detection_badge.configure(text=manos + ("   🙂 rostro" if rostro else ""))
+        _pintar_guia_colocacion()
+        camera_detection_badge.lift()
+    except Exception:
+        pass
+    root.after(160, actualizar_badge_deteccion_camara)
+
+actualizar_guia_colocacion()
+root.after(200, actualizar_badge_deteccion_camara)
+
+
+# ---------------- HISTORIAL EN TARJETAS + BÚSQUEDA ----------------
+try:
+    history_listbox.pack_forget()
+    history_scroll.pack_forget()
+    history_actions.pack_forget()
+except Exception:
+    pass
+
+history_toolbar = register_theme(tk.Frame(history_combined_blank_panel), "panel")
+history_toolbar.pack(fill="x", padx=22, pady=(0, 8), before=history_list_shell)
+history_toolbar.grid_columnconfigure(0, weight=1)
+
+history_search_var = tk.StringVar()
+history_search_entry = tk.Entry(
+    history_toolbar,
+    textvariable=history_search_var,
+    relief="flat", bd=0, highlightthickness=1,
+    font=(FONT, 10),
+)
+history_search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8), ipady=8)
+history_clear_all_cards_button = register_theme(
+    tk.Button(
+        history_toolbar,
+        text="Limpiar historial",
+        command=limpiar_historial_completo,
+        relief="flat", bd=0, padx=12, pady=8,
+        cursor="hand2", font=(FONT, 8, "bold"),
+    ),
+    "button",
+)
+history_clear_all_cards_button.grid(row=0, column=1)
+add_button_hover(history_clear_all_cards_button, "button")
+
+history_cards_canvas = tk.Canvas(history_list_shell, bd=0, highlightthickness=0)
+history_cards_scroll = tk.Scrollbar(history_list_shell, orient="vertical", command=history_cards_canvas.yview)
+history_cards_inner = tk.Frame(history_cards_canvas)
+history_cards_window = history_cards_canvas.create_window((0, 0), window=history_cards_inner, anchor="nw")
+history_cards_canvas.configure(yscrollcommand=history_cards_scroll.set)
+history_cards_canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
+history_cards_scroll.pack(side="right", fill="y", padx=(5, 8), pady=10)
+
+
+def _ajustar_historial_tarjetas(event=None):
+    try:
+        history_cards_canvas.configure(scrollregion=history_cards_canvas.bbox("all"))
+    except Exception:
+        pass
+
+
+def _ajustar_ancho_historial_tarjetas(event):
+    try:
+        history_cards_canvas.itemconfigure(history_cards_window, width=event.width)
+    except Exception:
+        pass
+
+history_cards_inner.bind("<Configure>", _ajustar_historial_tarjetas)
+history_cards_canvas.bind("<Configure>", _ajustar_ancho_historial_tarjetas)
+
+
+def _copiar_texto_historial_tarjeta(texto):
+    root.clipboard_clear()
+    root.clipboard_append(str(texto))
+    root.update()
+    set_status("Texto del historial copiado.")
+    mostrar_toast("Texto copiado")
+
+
+def _escuchar_texto_historial(texto):
+    import shutil
+    texto = str(texto or "").strip()
+    if not texto:
+        return
+    try:
+        if os.name == "nt":
+            # En Windows se conserva el comportamiento seguro: abrir Traducir y
+            # usar el motor ya integrado al proyecto solo cuando corresponda.
+            set_sidebar_active("Traducir")
+            set_status("Usa Escuchar en la oración para reproducir este texto.")
+            return
+        if shutil.which("spd-say"):
+            subprocess.Popen(["spd-say", texto])
+        elif shutil.which("espeak"):
+            subprocess.Popen(["espeak", texto])
+        else:
+            set_status("No se encontró un lector de voz del sistema.")
+            mostrar_toast("No se encontró lector de voz", "error")
+            return
+        mostrar_toast("Reproduciendo texto", "info")
+    except Exception:
+        set_status("No se pudo reproducir el texto.", error=True)
+
+
+def _borrar_historial_tarjeta(entry_id):
+    eliminar_historial(entry_id)
+    refrescar_historial_ui()
+    set_status("Elemento eliminado del historial.")
+    mostrar_toast("Elemento eliminado")
+
+
+def refrescar_historial_ui(*_):
+    if "history_cards_inner" not in globals():
+        return
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    try:
+        history_search_entry.configure(
+            bg=c["button"], fg=c["text"], insertbackground=c["text"],
+            highlightbackground=c["border"], highlightcolor=c["accent"],
+        )
+        history_cards_canvas.configure(bg=c["card"])
+        history_cards_inner.configure(bg=c["card"])
+        for child in history_cards_inner.winfo_children():
+            child.destroy()
+        query = history_search_var.get().strip().lower()
+        visibles = []
+        for item in reversed(history_entries):
+            texto = str(item.get("texto", "")).strip()
+            tipo = str(item.get("tipo", "Palabra"))
+            fecha = str(item.get("fecha", ""))
+            if not texto:
+                continue
+            if query and query not in texto.lower() and query not in tipo.lower() and query not in fecha.lower():
+                continue
+            visibles.append(item)
+
+        if not visibles:
+            empty = tk.Frame(history_cards_inner, bg=c["card"])
+            empty.pack(fill="both", expand=True, padx=12, pady=50)
+            tk.Label(empty, text="⌕", bg=c["card"], fg=c["accent"], font=(FONT, 24, "bold")).pack()
+            tk.Label(
+                empty,
+                text="Aún no tienes traducciones" if not query else "No hay resultados para esta búsqueda",
+                bg=c["card"], fg=c["text"], font=(FONT, 11, "bold"),
+            ).pack(pady=(6, 3))
+            tk.Label(
+                empty,
+                text="Las palabras y oraciones aparecerán aquí automáticamente.",
+                bg=c["card"], fg=c["muted"], font=(FONT, 8),
+            ).pack()
+        else:
+            for item in visibles:
+                entry_id = item.get("id")
+                texto = str(item.get("texto", "")).strip()
+                tipo = str(item.get("tipo", "Palabra"))
+                fecha = str(item.get("fecha", ""))
+                fecha_corta = fecha[5:16].replace(" ", " · ") if len(fecha) >= 16 else fecha
+                card = tk.Frame(
+                    history_cards_inner, bg=c["panel_alt"],
+                    highlightthickness=1, highlightbackground=c["border"],
+                )
+                card.pack(fill="x", padx=8, pady=5)
+                top = tk.Frame(card, bg=c["panel_alt"])
+                top.pack(fill="x", padx=12, pady=(10, 3))
+                tk.Label(
+                    top, text=texto, bg=c["panel_alt"], fg=c["text"],
+                    font=(FONT, 10, "bold"), anchor="w", justify="left", wraplength=650,
+                ).pack(side="left", fill="x", expand=True)
+                meta = tk.Label(
+                    card, text=f"{tipo}  ·  {fecha_corta}", bg=c["panel_alt"], fg=c["muted"],
+                    font=(FONT, 7), anchor="w",
+                )
+                meta.pack(fill="x", padx=12, pady=(0, 8))
+                actions = tk.Frame(card, bg=c["panel_alt"])
+                actions.pack(fill="x", padx=12, pady=(0, 10))
+                for label, command in (
+                    ("⧉ Copiar", lambda t=texto: _copiar_texto_historial_tarjeta(t)),
+                    ("▶ Escuchar", lambda t=texto: _escuchar_texto_historial(t)),
+                    ("⌫ Eliminar", lambda i=entry_id: _borrar_historial_tarjeta(i)),
+                ):
+                    b = tk.Button(
+                        actions, text=label, command=command,
+                        relief="flat", bd=0, bg=c["button"], fg=c["text"],
+                        activebackground=c["button_active"], activeforeground=c["text"],
+                        font=(FONT, 7, "bold"), padx=8, pady=5, cursor="hand2",
+                    )
+                    b.pack(side="left", padx=(0, 6))
+        _ajustar_historial_tarjetas()
+    except tk.TclError:
+        pass
+
+history_search_var.trace_add("write", refrescar_historial_ui)
+
+
+# ---------------- TEXTO → SEÑAS: NAVEGACIÓN, AUTOPLAY Y FALLBACK VISIBLE ----------------
+texto_senas_nav_index = 0
+texto_senas_nav_total = 0
+texto_senas_autoplay_job = None
+texto_senas_autoplay_active = False
+
+texto_senas_navbar = register_theme(tk.Frame(text_to_sign_panel), "panel")
+texto_senas_navbar.pack(fill="x", padx=22, pady=(0, 7), before=texto_senas_result_shell)
+texto_senas_navbar.grid_columnconfigure(1, weight=1)
+
+texto_senas_prev_button = register_theme(
+    tk.Button(texto_senas_navbar, text="◀ Anterior", relief="flat", bd=0, padx=10, pady=7, cursor="hand2", font=(FONT, 8, "bold")),
+    "button",
+)
+texto_senas_prev_button.grid(row=0, column=0)
+texto_senas_position_var = tk.StringVar(value="0/0")
+texto_senas_position_label = register_theme(
+    tk.Label(texto_senas_navbar, textvariable=texto_senas_position_var, font=(FONT, 8, "bold")),
+    "muted_panel",
+)
+texto_senas_position_label.grid(row=0, column=1)
+texto_senas_next_button = register_theme(
+    tk.Button(texto_senas_navbar, text="Siguiente ▶", relief="flat", bd=0, padx=10, pady=7, cursor="hand2", font=(FONT, 8, "bold")),
+    "button",
+)
+texto_senas_next_button.grid(row=0, column=2, padx=(0, 6))
+texto_senas_autoplay_button = register_theme(
+    tk.Button(texto_senas_navbar, text="▶ Reproducir", relief="flat", bd=0, padx=10, pady=7, cursor="hand2", font=(FONT, 8, "bold")),
+    "primary_button",
+)
+texto_senas_autoplay_button.grid(row=0, column=3)
+for _b in (texto_senas_prev_button, texto_senas_next_button):
+    add_button_hover(_b, "button")
+add_button_hover(texto_senas_autoplay_button, "primary_button")
+
+
+def _mover_texto_senas_indice(delta=0, absolute=None):
+    global texto_senas_nav_index
+    if texto_senas_nav_total <= 0:
+        texto_senas_nav_index = 0
+        texto_senas_position_var.set("0/0")
+        return
+    nuevo = absolute if absolute is not None else texto_senas_nav_index + delta
+    texto_senas_nav_index = max(0, min(texto_senas_nav_total - 1, int(nuevo)))
+    texto_senas_position_var.set(f"{texto_senas_nav_index + 1}/{texto_senas_nav_total}")
+    if texto_senas_nav_total <= 1:
+        pos = 0.0
+    else:
+        pos = texto_senas_nav_index / float(texto_senas_nav_total - 1)
+    try:
+        texto_senas_result_canvas.xview_moveto(max(0.0, min(1.0, pos)))
+    except Exception:
+        pass
+
+
+def _detener_autoplay_texto_senas():
+    global texto_senas_autoplay_job, texto_senas_autoplay_active
+    texto_senas_autoplay_active = False
+    if texto_senas_autoplay_job is not None:
+        try:
+            root.after_cancel(texto_senas_autoplay_job)
+        except Exception:
+            pass
+    texto_senas_autoplay_job = None
+    texto_senas_autoplay_button.configure(text="▶ Reproducir")
+
+
+def _paso_autoplay_texto_senas():
+    global texto_senas_autoplay_job
+    if not texto_senas_autoplay_active or texto_senas_nav_total <= 0:
+        _detener_autoplay_texto_senas()
+        return
+    if texto_senas_nav_index >= texto_senas_nav_total - 1:
+        _detener_autoplay_texto_senas()
+        return
+    _mover_texto_senas_indice(1)
+    texto_senas_autoplay_job = root.after(1250, _paso_autoplay_texto_senas)
+
+
+def _toggle_autoplay_texto_senas():
+    global texto_senas_autoplay_active, texto_senas_autoplay_job
+    if texto_senas_autoplay_active:
+        _detener_autoplay_texto_senas()
+        return
+    if texto_senas_nav_total <= 0:
+        return
+    texto_senas_autoplay_active = True
+    texto_senas_autoplay_button.configure(text="■ Detener")
+    if texto_senas_nav_index >= texto_senas_nav_total - 1:
+        _mover_texto_senas_indice(absolute=0)
+    texto_senas_autoplay_job = root.after(900, _paso_autoplay_texto_senas)
+
+texto_senas_prev_button.configure(command=lambda: _mover_texto_senas_indice(-1))
+texto_senas_next_button.configure(command=lambda: _mover_texto_senas_indice(1))
+texto_senas_autoplay_button.configure(command=_toggle_autoplay_texto_senas)
+
+_convertir_texto_a_senas_original_ui = convertir_texto_a_senas
+
+def convertir_texto_a_senas(event=None):
+    global texto_senas_nav_total, texto_senas_nav_index
+    _detener_autoplay_texto_senas()
+    _convertir_texto_a_senas_original_ui(event)
+    texto = texto_senas_var.get().strip()
+    if not texto:
+        texto_senas_nav_total = 0
+        _mover_texto_senas_indice(absolute=0)
+        c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+        if not texto_senas_result_inner.winfo_children():
+            empty = tk.Frame(texto_senas_result_inner, bg=c["panel_alt"], width=460, height=180)
+            empty.pack(side="left", fill="both", expand=True, padx=16, pady=35)
+            empty.pack_propagate(False)
+            tk.Label(empty, text="🤟", bg=c["panel_alt"], fg=c["accent"], font=(FONT, 26)).pack(pady=(26, 5))
+            tk.Label(empty, text='Prueba escribiendo “HOLA”', bg=c["panel_alt"], fg=c["text"], font=(FONT, 11, "bold")).pack()
+            tk.Label(empty, text="Las señas aparecerán aquí en orden.", bg=c["panel_alt"], fg=c["muted"], font=(FONT, 8)).pack(pady=(4, 0))
+        return
+
+    biblioteca = obtener_biblioteca_texto_a_senas()
+    plan = crear_plan_texto_a_senas(texto, biblioteca) if biblioteca else []
+    visual_plan = _expandir_plan_visual_texto_senas(plan) if plan else []
+    texto_senas_nav_total = min(40, len(visual_plan))
+    texto_senas_nav_index = 0
+    _mover_texto_senas_indice(absolute=0)
+
+    if plan:
+        faltantes_total = [item for item in plan if item.get("sample") is None]
+        letras_usadas = [item for item in plan if item.get("tipo") == "letra"]
+        if faltantes_total:
+            faltan = ", ".join(str(i.get("label", "")) for i in faltantes_total[:6])
+            texto_senas_info_var.set(
+                f"⚠ No disponible: {faltan}. El resto se muestra con señas o deletreo según los modelos existentes."
+            )
+        elif letras_usadas:
+            texto_senas_info_var.set(
+                f"✓ Traducción lista · se usan {len(letras_usadas)} letra(s) como deletreo cuando no hay una seña completa disponible."
+            )
+        else:
+            texto_senas_info_var.set(
+                f"✓ Traducción visual lista · {texto_senas_nav_total} imagen(es). Usa Anterior/Siguiente o reproducción automática."
+            )
+
+try:
+    texto_senas_convert_button.configure(command=convertir_texto_a_senas)
+    texto_senas_entry.bind("<Return>", convertir_texto_a_senas)
+except Exception:
+    pass
+
+_limpiar_texto_a_senas_original_ui = limpiar_texto_a_senas
+
+def limpiar_texto_a_senas():
+    global texto_senas_nav_total, texto_senas_nav_index
+    _detener_autoplay_texto_senas()
+    _limpiar_texto_a_senas_original_ui()
+    texto_senas_nav_total = 0
+    texto_senas_nav_index = 0
+    _mover_texto_senas_indice(absolute=0)
+    convertir_texto_a_senas()
+
+try:
+    texto_senas_clear_button.configure(command=limpiar_texto_a_senas)
+except Exception:
+    pass
+
+
+# ---------------- BIBLIOTECA / ADMINISTRADOR DE SEÑAS ----------------
+def _resumen_archivo_sena(ruta):
+    try:
+        data = _leer_json_modelo(ruta)
+        samples = data.get("samples", []) if isinstance(data, dict) else []
+    except Exception:
+        samples = []
+    total = len(samples)
+    dinamicas = sum(
+        1 for s in samples
+        if isinstance(s, dict) and (str(s.get("type", "")).lower() == "dynamic" or isinstance(s.get("frames"), list))
+    )
+    tipo = "dinámica" if dinamicas else "estática"
+    hand_counts = []
+    usa_cara = False
+    for s in samples:
+        if not isinstance(s, dict):
+            continue
+        if s.get("face") or s.get("face_sequence"):
+            usa_cara = True
+        if isinstance(s.get("hands"), list):
+            hand_counts.append(len(s.get("hands", [])))
+        elif isinstance(s.get("frames"), list) and s["frames"]:
+            first = s["frames"][0] if isinstance(s["frames"][0], dict) else {}
+            hand_counts.append(len(first.get("hands", [])))
+    hands_count = max(hand_counts) if hand_counts else 0
+    if total < 15:
+        quality = "Pocas"
+    elif total < 40:
+        quality = "En progreso"
+    else:
+        quality = "Buena"
+    return total, tipo, hands_count, usa_cara, quality
+
+
+def abrir_biblioteca_senas():
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    win = tk.Toplevel(root)
+    win.title("Biblioteca de señas · Manos que Hablan")
+    win.geometry("920x650")
+    win.minsize(760, 520)
+    win.configure(bg=c["bg"])
+    win.transient(root)
+
+    shell = tk.Frame(win, bg=c["panel"], highlightthickness=1, highlightbackground=c["border"])
+    shell.pack(fill="both", expand=True, padx=16, pady=16)
+    tk.Label(shell, text="Biblioteca de señas", bg=c["panel"], fg=c["text"], font=(FONT, 16, "bold"), anchor="w").pack(fill="x", padx=18, pady=(16, 2))
+    tk.Label(shell, text="Consulta, busca, prueba o vuelve a entrenar tus modelos locales.", bg=c["panel"], fg=c["muted"], font=(FONT, 9), anchor="w").pack(fill="x", padx=18, pady=(0, 10))
+
+    toolbar = tk.Frame(shell, bg=c["panel"])
+    toolbar.pack(fill="x", padx=18, pady=(0, 10))
+    search_var = tk.StringVar()
+    search = tk.Entry(toolbar, textvariable=search_var, relief="flat", bd=0, highlightthickness=1, bg=c["button"], fg=c["text"], insertbackground=c["text"], highlightbackground=c["border"], highlightcolor=c["accent"], font=(FONT, 10))
+    search.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 8))
+    tk.Button(toolbar, text="Actualizar", command=lambda: render(), relief="flat", bd=0, bg=c["button"], fg=c["text"], activebackground=c["button_active"], activeforeground=c["text"], font=(FONT, 8, "bold"), padx=12, pady=8, cursor="hand2").pack(side="right")
+
+    outer = tk.Frame(shell, bg=c["card"], highlightthickness=1, highlightbackground=c["border"])
+    outer.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+    canvas = tk.Canvas(outer, bd=0, highlightthickness=0, bg=c["card"])
+    scroll = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    inner = tk.Frame(canvas, bg=c["card"])
+    window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=scroll.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scroll.pack(side="right", fill="y")
+    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
+
+    def probar(nombre):
+        win.destroy()
+        set_sidebar_active("Traducir")
+        set_status(f"Prueba {nombre}: realiza la seña frente a la cámara.")
+        mostrar_toast(f"Prueba de {nombre}", "info")
+
+    def reentrenar(nombre):
+        globals()["training_prefill_sign_name"] = nombre
+        win.destroy()
+        abrir_ventana_entrenamiento()
+
+    def render(*_):
+        for child in inner.winfo_children():
+            child.destroy()
+        query = search_var.get().strip().lower()
+        rutas = list(sorted(LOCAL_TRAINED_MODELS_DIR.glob("*.json")))
+        rutas = [r for r in rutas if not query or query in r.stem.lower()]
+        if not rutas:
+            tk.Label(inner, text="Aún no hay señas entrenadas" if not query else "No se encontraron señas", bg=c["card"], fg=c["text"], font=(FONT, 11, "bold"), pady=40).pack(fill="x")
+            tk.Label(inner, text="Usa Entrenar modelo para crear tu primera seña.", bg=c["card"], fg=c["muted"], font=(FONT, 8)).pack(fill="x")
+            return
+        for ruta in rutas:
+            total, tipo, hc, face, quality = _resumen_archivo_sena(ruta)
+            row = tk.Frame(inner, bg=c["panel_alt"], highlightthickness=1, highlightbackground=c["border"])
+            row.pack(fill="x", padx=8, pady=5)
+            left = tk.Frame(row, bg=c["panel_alt"])
+            left.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+            tk.Label(left, text=ruta.stem.upper(), bg=c["panel_alt"], fg=c["text"], font=(FONT, 10, "bold"), anchor="w").pack(fill="x")
+            extras = f"{total} muestras · {hc or '—'} mano(s) · {tipo}"
+            if face:
+                extras += " · rostro"
+            tk.Label(left, text=extras, bg=c["panel_alt"], fg=c["muted"], font=(FONT, 8), anchor="w").pack(fill="x", pady=(2, 0))
+            qcolor = c["ok"] if quality == "Buena" else ("#D6A84B" if quality == "En progreso" else c["danger"])
+            tk.Label(left, text=f"● Calidad orientativa: {quality}", bg=c["panel_alt"], fg=qcolor, font=(FONT, 7, "bold"), anchor="w").pack(fill="x", pady=(3, 0))
+            actions = tk.Frame(row, bg=c["panel_alt"])
+            actions.pack(side="right", padx=10, pady=10)
+            tk.Button(actions, text="Probar", command=lambda n=ruta.stem.upper(): probar(n), relief="flat", bd=0, bg=c["accent"], fg=c["accent_text"], activebackground=c["accent_hover"], activeforeground=c["accent_text"], font=(FONT, 7, "bold"), padx=9, pady=6, cursor="hand2").pack(side="left", padx=(0, 5))
+            tk.Button(actions, text="Reentrenar", command=lambda n=ruta.stem.upper(): reentrenar(n), relief="flat", bd=0, bg=c["button"], fg=c["text"], activebackground=c["button_active"], activeforeground=c["text"], font=(FONT, 7, "bold"), padx=9, pady=6, cursor="hand2").pack(side="left", padx=(0, 5))
+            tk.Button(actions, text="Administrar/eliminar", command=lambda: (win.destroy(), eliminar_modelos_reconocimiento()), relief="flat", bd=0, bg=c["button"], fg=c["text"], activebackground=c["button_active"], activeforeground=c["text"], font=(FONT, 7, "bold"), padx=9, pady=6, cursor="hand2").pack(side="left")
+
+    search_var.trace_add("write", render)
+    render()
+    search.focus_set()
+
+# Botón de biblioteca dentro de la gestión de modelos existente.
+try:
+    library_models_button = tk.Button(
+        training_actions,
+        text="Biblioteca de señas",
+        command=abrir_biblioteca_senas,
+        relief="flat", bd=0, highlightthickness=1,
+        font=("DejaVu Sans", 9, "bold"), padx=8, pady=8, cursor="hand2",
+    )
+    library_models_button.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(7, 0))
+except Exception:
+    library_models_button = None
+
+
+# ---------------- MODELOS DEL SERVIDOR · INTERRUPTOR ----------------
+# Ubicado en Configuración > Avanzado, encima del selector de JSON locales.
+# Solo controla la fuente de modelos; no cambia MediaPipe ni el algoritmo de reconocimiento.
+server_models_separator = tk.Frame(settings_panel, height=1)
+server_models_label = tk.Label(
+    settings_panel,
+    text="MODELOS DEL SERVIDOR",
+    anchor="w",
+    font=(FONT, 8, "bold"),
+)
+server_models_box = tk.Frame(settings_panel, highlightthickness=1, bd=0)
+server_models_check = tk.Checkbutton(
+    server_models_box,
+    text="Utilizar modelos del servidor",
+    variable=use_server_models_var,
+    anchor="w",
+    font=(FONT, 9, "bold"),
+    cursor="hand2",
+    bd=0,
+    highlightthickness=0,
+)
+server_models_check.pack(fill="x", padx=10, pady=(9, 2))
+server_models_help = tk.Label(
+    server_models_box,
+    text="Activado: combina tus modelos locales con los modelos de PythonAnywhere.\nDesactivado: usa únicamente los modelos locales y no consulta el servidor.",
+    anchor="w",
+    justify="left",
+    font=(FONT, 8),
+    wraplength=420,
+)
+server_models_help.pack(fill="x", padx=10, pady=(0, 9))
+
+
+def _actualizar_estado_modelos_servidor_ui():
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    enabled = bool(use_server_models_var.get())
+    try:
+        server_models_help.configure(
+            text=(
+                "Activado: combina tus modelos locales con los modelos de PythonAnywhere."
+                if enabled
+                else "Desactivado: se usan únicamente los modelos locales; no se consulta PythonAnywhere."
+            )
+        )
+    except Exception:
+        pass
+    try:
+        if not enabled and "model_status_compact" in globals():
+            # El indicador principal conserva siempre la cantidad visible.
+            if "actualizar_indicador_modelos_cargados" in globals():
+                actualizar_indicador_modelos_cargados()
+            else:
+                model_status_compact.configure(text="● Modelos cargados: 0", fg=c["muted"])
+    except Exception:
+        pass
+
+
+def cambiar_uso_modelos_servidor():
+    """Activa/desactiva la fuente servidor sin borrar modelos ni tocar MediaPipe."""
+    global SERVER_MODEL_SYNC_ENABLED
+    global recognition_external_samples
+    global loaded_recognition_model_path
+    global loaded_recognition_model_data
+    global recognition_enabled
+
+    enabled = bool(use_server_models_var.get())
+    SERVER_MODEL_SYNC_ENABLED = enabled
+    _guardar_preferencias_ui()
+
+    if enabled:
+        set_status("Modelos del servidor activados · comprobando PythonAnywhere...")
+        _actualizar_estado_modelos_servidor_ui()
+        sincronizar_modelos_servidor()
+        try:
+            mostrar_toast("Modelos del servidor activados", "ok")
+        except Exception:
+            pass
+        return
+
+    # Si lo que estaba activo como fuente externa era precisamente la caché del
+    # servidor, la retiramos de RAM. Los modelos locales se recargan normalmente.
+    # Si el usuario había cargado manualmente otros JSON externos, no los borramos.
+    try:
+        servidor_estaba_activo = (
+            str(loaded_recognition_model_path or "") == str(MODEL_CACHE_FILE)
+        )
+    except Exception:
+        servidor_estaba_activo = False
+
+    if servidor_estaba_activo:
+        recognition_external_samples = []
+        loaded_recognition_model_path = None
+        loaded_recognition_model_data = None
+        cargar_modelos_locales_entrenados(mostrar_estado=False)
+        _reconstruir_muestras_reconocimiento()
+        recognition_enabled = bool(recognition_model_samples)
+
+    labels_locales = sorted({
+        item.get("label")
+        for item in recognition_local_samples
+        if isinstance(item, dict) and item.get("label")
+    })
+    set_status(f"Servidor desactivado · {len(labels_locales)} seña(s) locales disponibles.")
+    _actualizar_estado_modelos_servidor_ui()
+    try:
+        actualizar_barra_modelos(
+            "idle",
+            100,
+            f"Servidor desactivado · {len(labels_locales)} señas locales",
+        )
+    except Exception:
+        pass
+    try:
+        mostrar_toast("Usando solo modelos locales", "info")
+    except Exception:
+        pass
+
+
+server_models_check.configure(command=cambiar_uso_modelos_servidor)
+
+
+# ---------------- CONFIGURACIÓN: BÁSICO + AVANZADO ----------------
+settings_mode_bar = tk.Frame(settings_panel)
+settings_mode_bar.pack(fill="x", padx=16, pady=(14, 10), before=appearance_label)
+settings_basic_button = tk.Button(settings_mode_bar, text="Básico", relief="flat", bd=0, highlightthickness=1, font=(FONT, 9, "bold"), padx=10, pady=7, cursor="hand2")
+settings_advanced_button = tk.Button(settings_mode_bar, text="Avanzado", relief="flat", bd=0, highlightthickness=1, font=(FONT, 9, "bold"), padx=10, pady=7, cursor="hand2")
+settings_basic_button.pack(side="left", expand=True, fill="x", padx=(0, 4))
+settings_advanced_button.pack(side="left", expand=True, fill="x", padx=(4, 0))
+settings_advanced_visible = False
+
+advanced_settings_widgets = [
+    settings_separator, stabilization_label, stabilization_row,
+    training_separator, training_label, training_actions,
+    server_models_separator, server_models_label, server_models_box,
+    models_pick_box,
+]
+if "updates_separator" in globals():
+    advanced_settings_widgets.extend([
+        updates_separator, updates_label, update_version_label, update_status_label, updates_actions
+    ])
+
+# Diagnóstico visual.
+diagnostics_separator = tk.Frame(settings_panel, height=1)
+diagnostics_label = tk.Label(settings_panel, text="DIAGNÓSTICO", anchor="w", font=(FONT, 8, "bold"))
+diagnostics_box = tk.Frame(settings_panel, highlightthickness=1, bd=0)
+diagnostics_text_var = tk.StringVar(value="Pulsa Ejecutar diagnóstico para comprobar los componentes.")
+diagnostics_text = tk.Label(diagnostics_box, textvariable=diagnostics_text_var, anchor="w", justify="left", font=(FONT, 8), wraplength=360)
+diagnostics_text.pack(fill="x", padx=10, pady=(9, 7))
+diagnostics_actions = tk.Frame(diagnostics_box)
+diagnostics_actions.pack(fill="x", padx=10, pady=(0, 9))
+
+
+def _crear_diagnostico_texto():
+    import shutil
+    labels = sorted({
+        str(item.get("label")) for item in recognition_model_samples
+        if isinstance(item, dict) and item.get("label")
+    })
+    camera_ok = bool(camera_items)
+    hands_ok = hands is not None
+    face_ok = bool(FACE_MESH_AVAILABLE and face_mesh is not None)
+    voice_ok = bool(os.name == "nt" or shutil.which("spd-say") or shutil.which("espeak") or shutil.which("piper"))
+    server_ok = bool(server_online or model_sync_visual_state in ("connected", "validated", "ready"))
+    return "\n".join([
+        f"Cámara: {'✓' if camera_ok else '—'} {'disponible' if camera_ok else 'sin detectar'}",
+        f"MediaPipe Hands: {'✓' if hands_ok else '✗'}",
+        f"Modo Turbo: {'✓ activo' if TURBO_MODE_ENABLED else 'desactivado'}",
+        f"Entrada en vivo: {TURBO_PROCESS_WIDTH}×{TURBO_PROCESS_HEIGHT} @ hasta {CAMERA_TARGET_FPS:.0f} FPS" if TURBO_MODE_ENABLED else f"Entrada en vivo: {PROCESS_WIDTH}×{PROCESS_HEIGHT}",
+        f"Face Mesh: {'✓' if face_ok else '—'}",
+        f"Modelos: {len(labels)} {'✓' if labels else '—'}",
+        f"Voz: {'✓' if voice_ok else '—'}",
+        f"Servidor/modelos: {'✓' if server_ok else '—'}",
+    ])
+
+
+def ejecutar_diagnostico():
+    diagnostics_text_var.set(_crear_diagnostico_texto())
+    mostrar_toast("Diagnóstico actualizado")
+
+
+def copiar_diagnostico():
+    texto = diagnostics_text_var.get()
+    root.clipboard_clear()
+    root.clipboard_append(texto)
+    root.update()
+    mostrar_toast("Diagnóstico copiado")
+
+for txt, cmd in (("Ejecutar diagnóstico", ejecutar_diagnostico), ("Copiar", copiar_diagnostico)):
+    b = tk.Button(diagnostics_actions, text=txt, command=cmd, relief="flat", bd=0, highlightthickness=1, font=(FONT, 8, "bold"), padx=9, pady=7, cursor="hand2")
+    b.pack(side="left", expand=True, fill="x", padx=(0, 5) if txt.startswith("Ejecutar") else 0)
+
+advanced_settings_widgets.extend([diagnostics_separator, diagnostics_label, diagnostics_box])
+
+
+def _theme_settings_extra_widgets():
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    try:
+        settings_viewport.configure(bg=c["panel"])
+        settings_canvas.configure(bg=c["panel"])
+    except (NameError, tk.TclError):
+        pass
+    settings_mode_bar.configure(bg=c["panel"])
+    diagnostics_separator.configure(bg=c["border"])
+    diagnostics_label.configure(bg=c["panel"], fg=c["muted"])
+    diagnostics_box.configure(bg=c["panel_alt"], highlightbackground=c["border"])
+    diagnostics_text.configure(bg=c["panel_alt"], fg=c["text"])
+    diagnostics_actions.configure(bg=c["panel_alt"])
+    server_models_separator.configure(bg=c["border"])
+    server_models_label.configure(bg=c["panel"], fg=c["muted"])
+    server_models_box.configure(bg=c["panel_alt"], highlightbackground=c["border"])
+    server_models_check.configure(
+        bg=c["panel_alt"], fg=c["text"],
+        activebackground=c["panel_alt"], activeforeground=c["text"],
+        selectcolor=c["button"],
+    )
+    server_models_help.configure(bg=c["panel_alt"], fg=c["muted"])
+    _actualizar_estado_modelos_servidor_ui()
+    for child in diagnostics_actions.winfo_children():
+        child.configure(bg=c["button"], fg=c["text"], activebackground=c["button_active"], activeforeground=c["text"], highlightbackground=c["border"])
+    if globals().get("library_models_button") is not None:
+        library_models_button.configure(
+            bg=c["button"], fg=c["text"],
+            activebackground=c["button_active"], activeforeground=c["text"],
+            highlightbackground=c["border"],
+        )
+    for button, active in ((settings_basic_button, not settings_advanced_visible), (settings_advanced_button, settings_advanced_visible)):
+        button.configure(
+            bg=c["accent"] if active else c["button"],
+            fg=c["accent_text"] if active else c["text"],
+            activebackground=c["accent_hover"] if active else c["button_active"],
+            activeforeground=c["accent_text"] if active else c["text"],
+            highlightbackground=c["accent"] if active else c["border"],
+        )
+
+
+def _mostrar_config_avanzada(value):
+    global settings_advanced_visible
+    settings_advanced_visible = bool(value)
+    # Lo básico siempre queda visible. Avanzado agrega controles técnicos debajo.
+    for widget in advanced_settings_widgets:
+        try:
+            widget.pack_forget()
+        except Exception:
+            pass
+    if settings_advanced_visible:
+        # Reubicar después del bloque de landmarks, conservando todos los widgets.
+        settings_separator.pack(fill="x", padx=16, pady=(0, 14))
+        stabilization_label.pack(fill="x", padx=16, pady=(0, 7))
+        stabilization_row.pack(fill="x", padx=16, pady=(0, 16))
+        training_separator.pack(fill="x", padx=16, pady=(0, 14))
+        training_label.pack(fill="x", padx=16, pady=(0, 7))
+        training_actions.pack(fill="x", padx=16, pady=(0, 16))
+        server_models_separator.pack(fill="x", padx=16, pady=(0, 14))
+        server_models_label.pack(fill="x", padx=16, pady=(0, 7))
+        server_models_box.pack(fill="x", padx=16, pady=(0, 14))
+        models_pick_box.pack(fill="x", padx=16, pady=(0, 14))
+        if "updates_separator" in globals():
+            updates_separator.pack(fill="x", padx=16, pady=(0, 14))
+            updates_label.pack(fill="x", padx=16, pady=(0, 7))
+            update_version_label.pack(fill="x", padx=16, pady=(0, 4))
+            update_status_label.pack(fill="x", padx=16, pady=(0, 8))
+            updates_actions.pack(fill="x", padx=16, pady=(0, 14))
+        diagnostics_separator.pack(fill="x", padx=16, pady=(0, 14))
+        diagnostics_label.pack(fill="x", padx=16, pady=(0, 7))
+        diagnostics_box.pack(fill="x", padx=16, pady=(0, 16))
+    _theme_settings_extra_widgets()
+    try:
+        root.after_idle(_refresh_settings_scrollregion)
+    except (NameError, tk.TclError):
+        pass
+
+settings_basic_button.configure(command=lambda: _mostrar_config_avanzada(False))
+settings_advanced_button.configure(command=lambda: _mostrar_config_avanzada(True))
+_mostrar_config_avanzada(False)
+
+
+# ---------------- SINCRONIZACIÓN: BARRA SOLO CUANDO HAY ACTIVIDAD ----------------
+model_status_compact = register_theme(
+    tk.Label(left_panel, text="● Modelos cargados: 0", font=(FONT, 7, "bold"), anchor="center"),
+    "muted_panel",
+)
+model_status_compact.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+
+
+def _cantidad_modelos_cargados():
+    """Cantidad de señas/modelos únicos realmente preparados en RAM."""
+    return len({
+        str(item.get("label", "")).strip().upper()
+        for item in recognition_model_samples
+        if isinstance(item, dict) and str(item.get("label", "")).strip()
+    })
+
+
+def actualizar_indicador_modelos_cargados():
+    """Refresca SOLO el indicador visual, sin tocar reconocimiento ni MediaPipe."""
+    # Tkinter solo debe modificarse desde el hilo principal.
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    if "model_status_compact" not in globals():
+        return
+
+    cantidad = _cantidad_modelos_cargados()
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    model_status_compact.configure(
+        text=f"● Modelos cargados: {cantidad}",
+        fg=c["ok"] if cantidad > 0 else c["muted"],
+    )
+
+
+# Envolvemos las cargas locales para que el contador se actualice al entrenar,
+# eliminar o recargar JSON, sin modificar la lógica original de los modelos.
+_cargar_modelos_locales_entrenados_original_contador = cargar_modelos_locales_entrenados
+
+def cargar_modelos_locales_entrenados(mostrar_estado=False):
+    resultado = _cargar_modelos_locales_entrenados_original_contador(mostrar_estado=mostrar_estado)
+    try:
+        actualizar_indicador_modelos_cargados()
+    except Exception:
+        pass
+    return resultado
+
+
+# Lo mismo para los JSON externos elegidos manualmente desde Configuración.
+_cargar_rutas_modelo_reconocimiento_original_contador = _cargar_rutas_modelo_reconocimiento
+
+def _cargar_rutas_modelo_reconocimiento(rutas, mostrar_aviso=True):
+    resultado = _cargar_rutas_modelo_reconocimiento_original_contador(
+        rutas,
+        mostrar_aviso=mostrar_aviso,
+    )
+    try:
+        actualizar_indicador_modelos_cargados()
+    except Exception:
+        pass
+    return resultado
+
+
+_aplicar_barra_modelos_original_ui = _aplicar_barra_modelos_en_tk
+
+def _aplicar_barra_modelos_en_tk(estado, progreso=None, detalle=None):
+    _aplicar_barra_modelos_original_ui(estado, progreso, detalle)
+    c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+    estado = str(estado or "idle").lower()
+    activos = {"connecting", "connected", "downloading", "downloading_indeterminate", "verifying", "validated", "processing"}
+    try:
+        if estado in activos:
+            if not model_sync_frame.winfo_ismapped():
+                model_sync_frame.pack(fill="x", padx=4, pady=(10, 2))
+            model_status_compact.configure(text="● Actualizando modelos…", fg=c["accent"])
+        else:
+            model_sync_frame.pack_forget()
+            # Al terminar cualquier carga/sincronización, mostramos siempre
+            # cuántos modelos únicos quedaron realmente activos en memoria.
+            actualizar_indicador_modelos_cargados()
+            if estado == "error":
+                cantidad = _cantidad_modelos_cargados()
+                model_status_compact.configure(
+                    text=f"● Modelos cargados: {cantidad} · error",
+                    fg=c["danger"],
+                )
+    except Exception:
+        pass
+
+try:
+    model_sync_frame.pack_forget()
+except Exception:
+    pass
+
+
+# ---------------- ATAJOS DE TECLADO ----------------
+def _focus_es_editor_texto():
+    try:
+        widget = root.focus_get()
+        return isinstance(widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox))
+    except Exception:
+        return False
+
+
+def _shortcut_ctrl_c(event=None):
+    if _focus_es_editor_texto():
+        return None
+    if sidebar_active == "Traducir":
+        copiar_oracion()
+        mostrar_toast("Oración copiada")
+        return "break"
+    return None
+
+
+def _shortcut_ctrl_l(event=None):
+    if sidebar_active == "Traducir":
+        limpiar_oracion()
+        mostrar_toast("Oración limpiada")
+        return "break"
+    if sidebar_active == "Comunicar con señas":
+        limpiar_texto_a_senas()
+        mostrar_toast("Texto limpiado")
+        return "break"
+    return None
+
+root.bind("<Control-c>", _shortcut_ctrl_c, add="+")
+root.bind("<Control-C>", _shortcut_ctrl_c, add="+")
+root.bind("<Control-l>", _shortcut_ctrl_l, add="+")
+root.bind("<Control-L>", _shortcut_ctrl_l, add="+")
+
+
+# Refrescos iniciales de las nuevas vistas.
+refrescar_historial_ui()
+convertir_texto_a_senas()
+_theme_settings_extra_widgets()
+
+# Mantiene sincronizados los widgets creados por esta capa cuando cambia el tema.
+_apply_theme_original_ux = apply_theme
+
+def apply_theme(theme_name=None):
+    result = _apply_theme_original_ux(theme_name)
+    try:
+        _theme_settings_extra_widgets()
+        _pintar_guia_colocacion()
+        refrescar_historial_ui()
+        convertir_texto_a_senas()
+        c = THEMES.get(current_theme_name, THEMES["Oscuro"])
+        history_search_entry.configure(
+            bg=c["button"], fg=c["text"], insertbackground=c["text"],
+            highlightbackground=c["border"], highlightcolor=c["accent"],
+        )
+        model_status_compact.configure(bg=c["panel"])
+    except Exception:
+        pass
+    return result
+
+# Toasts también para las acciones rápidas ya existentes de la oración.
+def _copiar_oracion_con_toast():
+    antes = _texto_oracion_actual()
+    copiar_oracion()
+    if antes:
+        mostrar_toast("Oración copiada")
+
+
+def _limpiar_oracion_con_toast():
+    tenia = bool(_texto_oracion_actual())
+    limpiar_oracion()
+    if tenia:
+        mostrar_toast("Oración limpiada")
+
+try:
+    sentence_copy_button.configure(command=_copiar_oracion_con_toast)
+    sentence_clear_button.configure(command=_limpiar_oracion_con_toast)
+except Exception:
+    pass
+
 # Aplicar tema inicial respetando el sistema.
 apply_theme()
 
@@ -9842,26 +14365,46 @@ CAMERA_VIEW_HEIGHT = max(1, camera_label.winfo_height())
 # ==========================================================
 
 root.protocol("WM_DELETE_WINDOW", cerrar_app)
-root.bind("<Escape>", salir_video_fullscreen)
+root.bind("<Escape>", salir_modos_visuales)
+root.bind("<F10>", toggle_modo_presentacion)
 root.bind("<F11>", toggle_video_fullscreen)
 
 actualizar_camaras()
 actualizar_video()
 update_activity_graph()
 monitor_system_theme()
+programar_actualizacion_inicio_dashboard()
 
 # Carga primero TODOS los JSON entrenados localmente (uno por seña).
 # Después GitHub se combina como fuente externa, sin reemplazar los locales.
 cargar_modelos_locales_entrenados(mostrar_estado=False)
+actualizar_indicador_modelos_cargados()
 
 # Inicia el consumidor de estados visuales EN EL HILO PRINCIPAL de Tkinter.
 # Así el hilo de red jamás modifica widgets directamente.
 if not model_sync_ui_poller_running:
     root.after(10, procesar_cola_barra_modelos)
 
-# Carga/actualiza los modelos desde PythonAnywhere una sola vez al iniciar.
-# Después todo el reconocimiento se ejecuta localmente en RAM, sin viaje por Internet por frame.
-sincronizar_modelos_servidor()
+# Carga/actualiza los modelos desde PythonAnywhere al iniciar solo si el usuario
+# dejó marcada la opción “Utilizar modelos del servidor”.
+# El reconocimiento sigue ejecutándose localmente en RAM, sin viaje por Internet por frame.
+if SERVER_MODEL_SYNC_ENABLED:
+    sincronizar_modelos_servidor()
+else:
+    try:
+        set_status("Modelos del servidor desactivados · usando modelos locales.")
+        _actualizar_estado_modelos_servidor_ui()
+    except Exception:
+        pass
+
+# Revisión automática y ligera de /api/status. Si detecta un archivo nuevo,
+# eliminado o una model_version diferente, descarga /api/modelos y sustituye
+# los modelos en RAM sin cerrar ni reiniciar la aplicación.
+if SERVER_MODEL_AUTO_UPDATE_ENABLED:
+    root.after(
+        max(5000, int(SERVER_MODEL_AUTO_UPDATE_INTERVAL * 1000)),
+        comprobar_actualizaciones_modelos_automaticamente,
+    )
 
 # La campanita comprueba una vez al iniciar si existe una versión nueva.
 # Se hace después de arrancar la interfaz y en un hilo aparte, sin bloquear cámara.
